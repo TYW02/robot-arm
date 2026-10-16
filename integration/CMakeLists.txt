@@ -25,25 +25,25 @@ set(PICO_BOARD pico_w CACHE STRING "Board type" FORCE)
 # Import Pico SDK before project()
 include(pico_sdk_import.cmake)
 
-project(vision_test C CXX ASM)
+project(robotic_arm C CXX ASM)
 
 # Initialise the Pico SDK
 pico_sdk_init()
 
 # Application
-add_executable(vision_test
-    vision_test.c
+add_executable(robotic_arm
+    main.c
 )
 
-# Libraries: Link against pico_stdlib and the UART hardware library
-target_link_libraries(vision_test
+# Libraries
+target_link_libraries(robotic_arm
     pico_stdlib
     hardware_uart
 )
 
 # Use USB serial for printf output
-pico_enable_stdio_usb(vision_test 1)
-pico_enable_stdio_uart(vision_test 0) # Important: Disable stdio UART to avoid conflict
+pico_enable_stdio_usb(robotic_arm 1)
+pico_enable_stdio_uart(robotic_arm 0) # Important: Disable stdio UART to avoid conflict
 
 # Generate UF2/BIN/HEX files
-pico_add_extra_outputs(vision_test)
+pico_add_extra_outputs(robotic_arm)
