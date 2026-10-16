@@ -1,0 +1,25 @@
+# Build outputs
+build/
+*.uf2
+*.elf
+*.bin
+*.hex
+*.map
+
+# ESP-IDF specific
+sdkconfig
+sdkconfig.old
+managed_components/
+
+# Secrets
+.env
+
+# IDE / Editor
+.vscode/
+.devcontainer/
+.clangd
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
