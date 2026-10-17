@@ -1,4 +1,5 @@
 #include "freertos/FreeRTOS.h"
+#include "aruco_detect.h"
 #include "freertos/task.h"
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -14,6 +15,14 @@
 #define VISION_UART_RX_PIN   44   // D7 on XIAO ESP32-S3
 #define VISION_UART_BAUD     115200
 #define BUF_SIZE             256
+
+// ======================================================
+// Phase/Mode Management
+// ======================================================
+typedef enum { MODE_IDLE, MODE_SCAN, MODE_COLOR } vision_mode_t;
+
+// Start in COLOR mode by default
+static volatile vision_mode_t g_mode = MODE_SCAN; 
 
 static const char *TAG = "VISION";
 
@@ -267,10 +276,50 @@ static detection_t history_consensus(void)
     return result;
 }
 
+
+// UART Task to listen for mode commands from the Pico
+static void uart_rx_task(void *arg)
+{
+    uint8_t byte;
+    int state = 0;
+    char last_cmd = 0;
+
+    while (1) {
+        int n = uart_read_bytes(VISION_UART_NUM, &byte, 1, pdMS_TO_TICKS(100));
+        if (n == 1) {
+            if (byte == '\r') continue;
+            // Look for the pattern "M,X\n"
+            if (state == 0 && byte == 'M') state = 1;
+            else if (state == 1 && byte == ',') state = 2;
+            else if (state == 2) {
+                last_cmd = byte;
+                state = 3;
+            } 
+            else if (state == 3 && byte == '\n') {
+                if (last_cmd == 'S') {
+                    g_mode = MODE_SCAN;
+                    ESP_LOGI(TAG, "Switched to SCAN mode");
+                }
+                else if (last_cmd == 'C') {
+                    g_mode = MODE_COLOR;
+                    ESP_LOGI(TAG, "Switched to COLOR mode");
+                }
+                else if (last_cmd == 'I') g_mode = MODE_IDLE;
+                state = 0;
+            } else {
+                state = 0;  // Reset on unexpected byte
+            }
+        }
+    }
+}
+
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting color detection...");
     init_uart();
+
+    xTaskCreate(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL);
 
     if (init_camera() != ESP_OK) {
         ESP_LOGE(TAG, "Camera failed, halting");
@@ -284,10 +333,7 @@ void app_main(void)
     uint32_t last_send_ms = 0;
 
     while (1) {
-
-            ESP_LOGI(TAG, "Waiting for frame...");
             camera_fb_t *fb = esp_camera_fb_get();
-            ESP_LOGI(TAG, "Frame ready: %p", fb);
 
             if (!fb) {
                 ESP_LOGW(TAG, "Frame capture failed");
@@ -295,59 +341,61 @@ void app_main(void)
                 continue;
             }
 
-            detection_t det = detect_dominant_color(fb);
-            ESP_LOGI(TAG, "Detection: color=%d x=%d y=%d",
-                    det.color, det.x, det.y);
-            esp_camera_fb_return(fb);
+                // Branch based on mode (MODE_SCAN / MODE_COLOR)
+            if (g_mode == MODE_SCAN) {
+                // Aruco Scanning
+                aruco_result_t res = aruco_detect_frame(fb);
 
-        /*
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
+                if (res.detected) {
+                    char tx_buffer[48];
+                    int len = snprintf(tx_buffer, sizeof(tx_buffer),
+                                    "A,%d,%d,%d,%.1f,%.1f\n",
+                                    res.marker_id, (int)res.cx, (int)res.cy, res.width_px, res.distance_mm);
+                    uart_write_bytes(VISION_UART_NUM, tx_buffer, len);
+                }
+            } else if (g_mode == MODE_COLOR) {
+                // COLOR DETECTION
+                detection_t det = detect_dominant_color(fb);
+                
 
-        detection_t det = detect_dominant_color(fb);
-        esp_camera_fb_return(fb);
-        */
+                // Push into history
+                history[history_idx] = det;
+                history_idx = (history_idx + 1) % HISTORY_LEN;
 
-        // Push into history
-        history[history_idx] = det;
-        history_idx = (history_idx + 1) % HISTORY_LEN;
+                detection_t consensus = history_consensus();
+                uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        detection_t consensus = history_consensus();
-        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                // Send if the color changed, position moved significantly, or it's been 1s
+                bool color_changed = (consensus.color != last_sent_color);
+                bool moved_far     = (abs(consensus.x - last_sent_x) > 10) ||
+                                    (abs(consensus.y - last_sent_y) > 10);
+                bool stale         = (now_ms - last_send_ms) > 1000;
 
-        // Send if the color changed, position moved significantly, or it's been 1s
-        bool color_changed = (consensus.color != last_sent_color);
-        bool moved_far     = (abs(consensus.x - last_sent_x) > 10) ||
-                             (abs(consensus.y - last_sent_y) > 10);
-        bool stale         = (now_ms - last_send_ms) > 1000;
+                if (color_changed || moved_far || stale) {
+                    const char *name = (consensus.color == COLOR_RED)   ? "R"
+                                    : (consensus.color == COLOR_GREEN) ? "G"
+                                    : (consensus.color == COLOR_BLUE)  ? "B"
+                                    : "N";
 
-        if (color_changed || moved_far || stale) {
-            const char *name = (consensus.color == COLOR_RED)   ? "R"
-                             : (consensus.color == COLOR_GREEN) ? "G"
-                             : (consensus.color == COLOR_BLUE)  ? "B"
-                             : "N";
-
-            char tx_buffer[32];
-            int len;
-            if (consensus.color == COLOR_NONE || consensus.x < 0) {
-                len = snprintf(tx_buffer, sizeof(tx_buffer), "C,N\n");
-            } else {
-                len = snprintf(tx_buffer, sizeof(tx_buffer),
-                               "C,%s,%d,%d\n", name, consensus.x, consensus.y);
+                    char tx_buffer[32];
+                    int len;
+                    if (consensus.color == COLOR_NONE || consensus.x < 0) {
+                        len = snprintf(tx_buffer, sizeof(tx_buffer), "C,N\n");
+                    } else {
+                        len = snprintf(tx_buffer, sizeof(tx_buffer),
+                                    "C,%s,%d,%d\n", name, consensus.x, consensus.y);
+                    }
+                    uart_write_bytes(VISION_UART_NUM, tx_buffer, len);
+                    
+                    last_sent_color = consensus.color;
+                    last_sent_x = consensus.x;
+                    last_sent_y = consensus.y;
+                    last_send_ms = now_ms;
+                }
             }
-            uart_write_bytes(VISION_UART_NUM, tx_buffer, len);
-            
-            ESP_LOGI(TAG, "Sent %d bytes: %s", len, tx_buffer);
-            
-            last_sent_color = consensus.color;
-            last_sent_x = consensus.x;
-            last_sent_y = consensus.y;
-            last_send_ms = now_ms;
-        }
 
+            
+        esp_camera_fb_return(fb);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }

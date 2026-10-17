@@ -10,68 +10,87 @@
 #define UART_ID uart0
 #define BAUD_RATE 115200
 
-// Pico W UART0 default pins: TX=GP0, RX=GP1
 #define UART_TX_PIN 0
 #define UART_RX_PIN 1
 
-#define DATA_BITS 8
-#define STOP_BITS 1
-#define PARITY    UART_PARITY_NONE
+void send_mode_command(const char* mode) {
+    uart_write_blocking(UART_ID, (const uint8_t*)mode, strlen(mode));
+}
 
-// ======================================================
-// Main Application
-// ======================================================
 int main() {
-    // Initialize USB serial for printf output
     stdio_init_all();
-    sleep_ms(2000); // Wait for USB connection
+    sleep_ms(2000); 
 
-    printf("Pico W UART Vision Test\n");
+    printf("Pico W Mode Switching Test\n");
 
-    // 1. Initialize UART0 with the specified pins and settings
     uart_init(UART_ID, BAUD_RATE);
     gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
     gpio_pull_up(UART_RX_PIN); 
-    uart_set_format(UART_ID, DATA_BITS, STOP_BITS, PARITY);
-    uart_set_fifo_enabled(UART_ID, true); // Enable FIFO for smoother data handling
-
-    printf("UART0 initialized on GP%d (TX) and GP%d (RX) at %d baud.\n",
-           UART_TX_PIN, UART_RX_PIN, BAUD_RATE);
-    printf("Waiting for vision data from XIAO...\n");
+    uart_set_format(UART_ID, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(UART_ID, true);
 
     char buffer[128];
     int index = 0;
+    
+    // Variables to handle automatic mode switching
+    bool is_scan_mode = false;
+    uint32_t last_switch_time = to_ms_since_boot(get_absolute_time());
 
     while (true) {
-        // 2. Check if data is available to read
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+
+        // 1. Switch modes every 10 seconds
+        if (now - last_switch_time > 10000) {
+            is_scan_mode = !is_scan_mode;
+            
+            if (is_scan_mode) {
+                printf("\n>>> Switched to SCAN (ArUco) Mode <<<\n");
+                send_mode_command("M,S\n");
+            } else {
+                printf("\n>>> Switched to COLOR Mode <<<\n");
+                send_mode_command("M,C\n");
+            }
+            last_switch_time = now;
+        }
+
+        // 2. Read data from XIAO
         if (uart_is_readable(UART_ID)) {
             char ch = uart_getc(UART_ID);
 
-            // If we receive a newline, process the full line
             if (ch == '\n') {
                 buffer[index] = '\0';
 
-                char color;
-                int x = -1, y = -1;
-
-                if (sscanf(buffer, "C,%c,%d,%d", &color, &x, &y) == 3) {
-                    printf("COLOR -> %c  X=%d  Y=%d\n", color, x, y);
-                } else if (sscanf(buffer, "C,%c", &color) == 1) {
-                    printf("COLOR -> %c  (no position)\n", color);
-                } else {
-                    printf("Unrecognized: '%s'\n", buffer);
+                while (index > 0 && (buffer[index-1] == '\r')) {
+                    buffer[--index] = '\0';
                 }
 
+                char color;
+                int x = -1, y = -1;
+                int id;
+                float w, dist;
+                char *start;
+
+                // Parse ArUco Data
+                if ((start = strstr(buffer, "A,")) != NULL) {
+                    if (sscanf(start, "A,%d,%d,%d,%f,%f", &id, &x, &y, &w, &dist) == 5) {
+                        printf("ARUCO -> ID: %d, X: %d, Y: %d, Dist: %.1f mm\n", id, x, y, dist);
+                    }
+                } 
+                // Parse Color Data
+                else if ((start = strstr(buffer, "C,")) != NULL) {
+                    if (sscanf(start, "C,%c,%d,%d", &color, &x, &y) == 3) {
+                        printf("COLOR -> %c  X=%d  Y=%d\n", color, x, y);
+                    } else if (sscanf(start, "C,%c", &color) == 1) {
+                        printf("COLOR -> %c\n", color);
+                    }
+                } 
                 index = 0;
             }
             else if (index < sizeof(buffer) - 1) {
                 buffer[index++] = ch;
             }
-            // If buffer is full without newline, it will be reset on next newline
         }
-
-        // Small sleep to prevent tight loop, though UART FIFO makes this less critical
         sleep_ms(1);
     }
 
