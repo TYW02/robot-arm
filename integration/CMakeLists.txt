@@ -39,6 +39,8 @@ add_executable(robotic_arm
 target_link_libraries(robotic_arm
     pico_stdlib
     hardware_uart
+    hardware_irq
+    pico_util
 )
 
 # Use USB serial for printf output
