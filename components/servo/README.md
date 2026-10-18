@@ -24,7 +24,7 @@ This document outlines the servo pin connections, calibration limits (pulse widt
 ### Base Motor (Channel 0)
 * **Extreme Left:** $400\ \mu\text{s}$
 * **$90^\circ$ Left:** $450\ \mu\text{s}$
-* **Middle / Center:** $1800\text{--}1900\ \mu\text{s}$ *(last calibrated: $1900\ \mu\text{s}$)*
+* **Middle / Center:** $1800\text{--}1900\ \mu\text{s}$ 
 * **Extreme Right:** $3250\ \mu\text{s}$
 * **$90^\circ$ Right:** *Not physically possible*
 
