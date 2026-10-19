@@ -7,196 +7,183 @@
 #include "hardware/i2c.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
-#define IMU_TASK_PERIOD_US  20000ULL
-#define IMU_BUS_LOCK_MS     10
+#define IMU_PERIOD_US 20000ULL
+#define IMU_LOCK_TIMEOUT_MS 10
 
 static imu_task_config_t cfg;
-static ID task_id = 0;
+static ID imu_task_id = 0;
 
-// Allow calibration to yield to other tasks.
-static void task_delay_ms(
+// Use kernel delays during calibration.
+static void kernel_delay(
     uint32_t ms,
-    void *context
+    void *ctx
 ) {
-    (void)context;
-    (void)tk_dly_tsk(ms);
+    (void)ctx;
+    (void)tk_dly_tsk((RELTIM)ms);
 }
 
-// Shared I2C mutex callbacks
-static bool bus_lock(void *context) {
-    ID mutex = *(const ID *)context;
+// Protect the shared I2C bus.
+static bool lock_i2c(void *ctx) {
+    ID id = *(const ID *)ctx;
 
     return tk_loc_mtx(
-        mutex, IMU_BUS_LOCK_MS
+        id,
+        IMU_LOCK_TIMEOUT_MS
     ) == E_OK;
 }
 
-static void bus_unlock(void *context) {
-    ID mutex = *(const ID *)context;
-
-    (void)tk_unl_mtx(mutex);
+static void unlock_i2c(void *ctx) {
+    ID id = *(const ID *)ctx;
+    (void)tk_unl_mtx(id);
 }
 
-// Send IMU result to Coordinator
+// Send a result without blocking sensor sampling.
 static bool send_result(
-    imu_event_type_t event,
-    uint32_t request_id,
-    const imu_reading_t *reading
+    imu_event_type_t type,
+    uint32_t request,
+    const imu_reading_t *s
 ) {
-    imu_result_t msg = {0};
+    imu_result_t r = {0};
 
-    msg.request_id = request_id;
-    msg.event = event;
+    r.event = type;
+    r.request_id = request;
 
-    if (reading != NULL) {
-        msg.pitch_deg = reading->pitch_deg;
-        msg.roll_deg = reading->roll_deg;
-        msg.sample_time_us = reading->timestamp_us;
-        msg.interval_us = reading->interval_us;
+    if (s) {
+        r.pitch_deg = s->pitch_deg;
+        r.roll_deg = s->roll_deg;
+        r.sample_time_us = s->timestamp_us;
+        r.interval_us = s->interval_us;
     }
 
-    // Nonblocking: do not delay sensor sampling.
     return tk_snd_mbf(
         cfg.result_mbf,
-        &msg,
-        sizeof(msg),
+        &r,
+        sizeof(r),
         TMO_POL
     ) == E_OK;
 }
 
-// -------------------------------------------------
-// µT-Kernel IMU Task
-// -------------------------------------------------
-
-static void imu_task(INT stacd, void *exinf) {
+// Main IMU Task
+static void task_entry(
+    INT stacd,
+    void *exinf
+) {
     (void)stacd;
     (void)exinf;
 
     imu_verifier_t verifier = {0};
     imu_reading_t reading = {0};
 
-    uint32_t active_request = 0;
+    uint32_t active_id = 0;
+    bool online;
 
     imu_set_bus_lock(
-        bus_lock,
-        bus_unlock,
+        lock_i2c,
+        unlock_i2c,
         &cfg.shared_i2c_mutex
     );
 
-    imu_set_delay(task_delay_ms, NULL);
+    imu_set_delay(kernel_delay, NULL);
 
-    // I2C pins must already be configured.
-    // Keep arm stationary during calibration.
-    bool online = imu_init(i2c1);
+    // The robot must be stationary during calibration.
+    // Shared I2C was already set up during startup.
+    online = imu_init(i2c1);
 
-    send_result(
-        online ? IMU_EVT_READY : IMU_EVT_FAULT,
-        0,
-        NULL
-    );
+    if (!send_result(
+            online ? IMU_EVT_READY : IMU_EVT_FAULT,
+            0,
+            NULL
+        )) {
+        online = false;
+    }
 
-    uint64_t next_sample_us =
-        time_us_64() + IMU_TASK_PERIOD_US;
+    uint64_t next_us = time_us_64() + IMU_PERIOD_US;
 
     while (true) {
 
-        // -----------------------------------------
-        // 1. Check commands from Coordinator
-        // -----------------------------------------
+        // 1. Receive commands from Coordinator.
+        imu_command_t command;
 
-        imu_command_t cmd;
-
-        // Process a bounded number per cycle.
-        for (int i = 0; i < 8; i++) {
-            INT received = tk_rcv_mbf(
+        for (unsigned k = 0; k < 4; ++k) {
+            INT n = tk_rcv_mbf(
                 cfg.command_mbf,
-                &cmd,
+                &command,
                 TMO_POL
             );
 
-            if (received < 0) {
+            if (n < 0) {
                 break;
             }
 
-            if (received != (INT)sizeof(cmd)) {
-                if (active_request != 0) {
-                    send_result(
-                        IMU_EVT_FAULT,
-                        active_request,
-                        NULL
-                    );
-                }
-
+            if (n != (INT)sizeof(command)) {
                 imu_verify_cancel(&verifier);
-                active_request = 0;
+                active_id = 0;
                 continue;
             }
 
-            if (cmd.command == IMU_CMD_CANCEL) {
+            if (command.command == IMU_CMD_CANCEL) {
                 imu_verify_cancel(&verifier);
-                active_request = 0;
+                active_id = 0;
             }
 
-            else if (cmd.command == IMU_CMD_REINIT) {
+            else if (command.command == IMU_CMD_REINIT) {
                 imu_verify_cancel(&verifier);
-                active_request = 0;
+                active_id = 0;
 
-                // Only reinitialise when stationary.
+                // Recalibration requires a stationary arm.
                 online = imu_init(i2c1);
 
-                send_result(
-                    online
-                        ? IMU_EVT_READY
-                        : IMU_EVT_FAULT,
-                    0,
-                    NULL
-                );
+                if (!send_result(
+                        online
+                            ? IMU_EVT_READY
+                            : IMU_EVT_FAULT,
+                        0,
+                        NULL
+                    )) {
+                    online = false;
+                }
 
-                next_sample_us =
-                    time_us_64() + IMU_TASK_PERIOD_US;
+                next_us = time_us_64() + IMU_PERIOD_US;
             }
 
-            else if (cmd.command == IMU_CMD_VERIFY) {
+            else if (command.command == IMU_CMD_VERIFY) {
                 imu_verify_cancel(&verifier);
-                active_request = 0;
+                active_id = 0;
 
-                // The request must correspond to the
-                // current stationary placement pose.
-                if (!online ||
-                    !imu_verify_begin(
+                // Coordinator supplies the current
+                // placement target and unique request ID.
+                if (online && imu_verify_begin(
                         &verifier,
-                        cmd.request_id,
-                        cmd.target_pitch_deg,
-                        cmd.target_roll_deg,
+                        command.request_id,
+                        command.target_pitch_deg,
+                        command.target_roll_deg,
                         time_us_64()
                     )) {
 
-                    send_result(
-                        IMU_EVT_FAULT,
-                        cmd.request_id,
-                        NULL
-                    );
+                    active_id = command.request_id;
+
                 } else {
-                    active_request = cmd.request_id;
+                    if (!send_result(
+                            IMU_EVT_FAULT,
+                            command.request_id,
+                            NULL
+                        )) {
+                        online = false;
+                    }
                 }
             }
         }
 
-        // -----------------------------------------
-        // 2. Take an IMU sample
-        // -----------------------------------------
-
+        // 2. Sample the MPU-6500.
         if (online) {
-            bool updated = imu_update();
+            bool ok = imu_update();
 
-            imu_get_reading(&reading);
+            (void)imu_get_reading(&reading);
 
-            // -------------------------------------
-            // 3. Check requested orientation
-            // -------------------------------------
-
-            if (active_request != 0) {
+            // 3. Verify orientation if requested.
+            if (active_id != 0) {
                 imu_verify_result_t result =
                     imu_verify_step(
                         &verifier,
@@ -204,113 +191,103 @@ static void imu_task(INT stacd, void *exinf) {
                         time_us_64()
                     );
 
-                if (!updated ||
+                imu_event_type_t event = 0;
+
+                if (!ok ||
                     result == IMU_VERIFY_SENSOR_FAULT) {
 
-                    send_result(
-                        IMU_EVT_FAULT,
-                        active_request,
-                        &reading
-                    );
+                    event = IMU_EVT_FAULT;
 
-                    imu_verify_cancel(&verifier);
-                    active_request = 0;
-                }
+                } else if (
+                    result == IMU_VERIFY_PASS
+                ) {
+                    event = IMU_EVT_VERIFIED;
 
-                else if (result == IMU_VERIFY_PASS) {
-                    send_result(
-                        IMU_EVT_VERIFIED,
-                        active_request,
-                        &reading
-                    );
-
-                    active_request = 0;
-                }
-
-                else if (
+                } else if (
                     result == IMU_VERIFY_OUT_OF_TOLERANCE
                 ) {
-                    send_result(
-                        IMU_EVT_OUT_OF_TOLERANCE,
-                        active_request,
-                        &reading
-                    );
+                    event = IMU_EVT_OUT_OF_TOLERANCE;
+                }
 
-                    active_request = 0;
+                if (event != 0) {
+                    // If the result buffer is unavailable,
+                    // disable verification until reinit.
+                    if (!send_result(
+                            event,
+                            active_id,
+                            &reading
+                        )) {
+                        online = false;
+                    }
+
+                    active_id = 0;
+                    imu_verify_cancel(&verifier);
                 }
             }
         }
 
-        // -----------------------------------------
-        // 4. Sleep until next sampling period
-        // -----------------------------------------
-
+        // 4. Wait for next scheduled sample.
         uint64_t now = time_us_64();
 
-        if (now >= next_sample_us) {
-            // Missed scheduled target; reset cadence.
-            next_sample_us =
-                now + IMU_TASK_PERIOD_US;
-
-            tk_dly_tsk(1);
+        if (now >= next_us) {
+            next_us = now + IMU_PERIOD_US;
         } else {
-            uint64_t remaining_us =
-                next_sample_us - now;
+            uint64_t remaining = next_us - now;
 
-            UINT delay_ms = (UINT)(
-                (remaining_us + 999ULL) / 1000ULL
+            RELTIM wait_ms = (RELTIM)(
+                (remaining + 999ULL) / 1000ULL
             );
 
-            tk_dly_tsk(
-                delay_ms > 0 ? delay_ms : 1
+            (void)tk_dly_tsk(
+                wait_ms ? wait_ms : 1
             );
 
-            next_sample_us += IMU_TASK_PERIOD_US;
+            next_us += IMU_PERIOD_US;
+            continue;
         }
+
+        (void)tk_dly_tsk(1);
     }
 }
 
-// -------------------------------------------------
-// Create and start IMU Task
-// -------------------------------------------------
-
+// Create and start the µT-Kernel IMU Task.
 ID imu_utkernel_start(
-    const imu_task_config_t *config
+    const imu_task_config_t *configuration
 ) {
-    if (config == NULL ||
-        config->shared_i2c_mutex <= 0 ||
-        config->command_mbf <= 0 ||
-        config->result_mbf <= 0 ||
-        config->priority <= 0 ||
-        config->stack_bytes < 1024 ||
-        task_id > 0) {
+    if (!configuration ||
+        configuration->shared_i2c_mutex <= 0 ||
+        configuration->command_mbf <= 0 ||
+        configuration->result_mbf <= 0 ||
+        configuration->priority <= 0 ||
+        configuration->stack_bytes < 1024 ||
+        imu_task_id > 0) {
 
         return E_PAR;
     }
 
-    cfg = *config;
+    cfg = *configuration;
 
-    T_CTSK task = {0};
+    T_CTSK t = {0};
 
-    task.tskatr = TA_HLNG | TA_RNG3;
-    task.task = imu_task;
-    task.itskpri = cfg.priority;
-    task.stksz = cfg.stack_bytes;
+    t.tskatr = TA_HLNG | TA_RNG3;
+    t.task = task_entry;
+    t.itskpri = cfg.priority;
+    t.stksz = cfg.stack_bytes;
 
-    ID id = tk_cre_tsk(&task);
+    ID id = tk_cre_tsk(&t);
 
     if (id <= 0) {
         return id;
     }
 
-    ER result = tk_sta_tsk(id, 0);
+    ER err = tk_sta_tsk(id, 0);
 
-    if (result != E_OK) {
-        tk_del_tsk(id);
-        return result;
+    if (err != E_OK) {
+        (void)tk_del_tsk(id);
+        return err;
     }
 
-    task_id = id;
+    imu_task_id = id;
 
     return id;
 }
