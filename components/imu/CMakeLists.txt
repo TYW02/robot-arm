@@ -17,6 +17,7 @@ pico_sdk_init()
 add_executable(imu_test
     imu_test.c
     imu.c
+    imu_verify.c
 )
 
 # Link the required libraries
