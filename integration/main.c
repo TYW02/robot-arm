@@ -1,278 +1,323 @@
-#include <stdio.h>
-#include <string.h>
-#include <stdarg.h>
-#include "pico/stdlib.h"
-#include "hardware/uart.h"
-#include "hardware/irq.h"
-#include "pico/util/queue.h"
+// integration/main.c
+#include <tk/tkernel.h>
+#include <tm/tmonitor.h>
 
 // ======================================================
-// UART Configuration
+// Kernel Objects
 // ======================================================
-#define UART_ID uart0
-#define BAUD_RATE 115200
-#define UART_TX_PIN 0
-#define UART_RX_PIN 1
+LOCAL ID task_uart_id;
+LOCAL ID task_state_id;
+LOCAL ID uart_device_id;
+LOCAL ID command_mbf_id; // State-machine commands are sent to the UART owner task.
+LOCAL ID mtx_id;  // Mutex for shared variables
+
+#define RX_LINE_SIZE 128
+typedef struct { UB bytes[4]; } ModeCommand;
+LOCAL UW command_mbf_buffer[(4 * sizeof(ModeCommand)) / sizeof(UW) + 16];
+
+LOCAL void task_uart_parser(INT stacd, void *exinf);
+LOCAL T_CTSK ctsk_uart = {
+    .itskpri = 5, .stksz = 4096, .task = task_uart_parser,
+#if TK_SUPPORT_SMP
+    .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC, .assprc = TP_PRC1,
+#else
+    .tskatr = TA_HLNG | TA_RNG3,
+#endif
+};
+
+LOCAL void task_state_machine(INT stacd, void *exinf);
+LOCAL T_CTSK ctsk_state = {
+    .itskpri = 10, .stksz = 4096, .task = task_state_machine,
+#if TK_SUPPORT_SMP
+    .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC, .assprc = TP_PRC2,
+#else
+    .tskatr = TA_HLNG | TA_RNG3,
+#endif
+};
+
+LOCAL T_CMBF cmbf = {
+    .bufsz = sizeof(command_mbf_buffer), .maxmsz = sizeof(ModeCommand),
+    .mbfatr = TA_TFIFO, .bufptr = command_mbf_buffer,
+};
+LOCAL T_CMTX cmtx = { .mtxatr = TA_TFIFO | TA_INHERIT };
 
 // ======================================================
-// Ring Buffer & IRQ
-// ======================================================
-#define RX_BUFFER_SIZE 256
-static queue_t rx_queue;
-
-// UART Interrupt Service Routine (ISR)
-void on_uart_rx() {
-    // Read a maximum of 16 bytes per interrupt
-    int max_read = 16; 
-    while (uart_is_readable(UART_ID) && max_read > 0) {
-        uint8_t ch = uart_getc(UART_ID);
-        queue_try_add(&rx_queue, &ch);
-        max_read--;
-    }
-    // Clear the RX interrupt flag explicitly
-    uart_get_hw(UART_ID)->icr = UART_UARTICR_RXIC_BITS; 
-}
-
-void setup_uart_irq() {
-    queue_init(&rx_queue, sizeof(uint8_t), RX_BUFFER_SIZE);
-    
-    // Set interrupt priority lower so it doesn't block USB
-    irq_set_exclusive_handler(UART0_IRQ, on_uart_rx);
-    irq_set_priority(UART0_IRQ, 0x80); // Lowest priority
-    irq_set_enabled(UART0_IRQ, true);
-    
-    uart_set_irq_enables(UART_ID, true, false); 
-}
-
-// ======================================================
-// State Machine & Object Storage
+// Shared Variables
 // ======================================================
 #define MAX_OBJECTS 16
-
-typedef struct {
-    int id;
-    int x;
-    int y;
-    float distance;
-} aruco_obj_t;
-
+typedef struct { int id; int x; int y; float distance; } aruco_obj_t;
 aruco_obj_t shelf_map[MAX_OBJECTS];
 int shelf_count = 0;
 
-typedef enum {
-    STATE_IDLE,
-    STATE_SCAN_SHELF,
-    STATE_WAIT_SHELF_RESULTS,
-    STATE_MOVE_TO_PAYLOAD,
-    STATE_RE_SCAN_PAYLOAD,
-    STATE_WAIT_PAYLOAD_RESULTS,
-    STATE_EXECUTE_PICK,
-    STATE_FAULT
-} system_state_t;
-
 void send_mode_command(const char* mode) {
-    uart_write_blocking(UART_ID, (const uint8_t*)mode, strlen(mode));
+    ModeCommand command = {{0, 0, 0, 0}};
+    UW len = 0;
+    while (mode[len] != '\0' && len < sizeof(command.bytes)) {
+        command.bytes[len] = (UB)mode[len];
+        ++len;
+    }
+    if (len == 0 || tk_snd_mbf(command_mbf_id, &command,
+                               sizeof(command), TMO_FEVR) < E_OK) {
+        tm_printf((UB*)"[UART] failed to queue mode command\n");
+    }
 }
 
-int main() {
-    stdio_init_all();
-    
-    // 1. Wait 3 seconds for USB to connect to your PC
-    for (int i = 0; i < 6; i++) {
-        printf("Booting up... %d\n", i);
-        sleep_ms(500);
+// ======================================================
+// Custom Parsing Helpers (Replaces string.h and stdio.h)
+// ======================================================
+int my_strlen(const char *s) { int len=0; while(*s++) len++; return len; }
+
+char* my_strchr(const char *s, int c) {
+    while (*s != (char)c) { if (!*s++) return 0; }
+    return (char*)s;
+}
+
+char* my_strstr(const char *haystack, const char *needle) {
+    if (!*needle) return (char*)haystack;
+    char *p1 = (char*)haystack;
+    while (*p1) {
+        char *p1_begin = p1;
+        char *p2 = (char*)needle;
+        while (*p1 && *p2 && *p1 == *p2) { p1++; p2++; }
+        if (!*p2) return p1_begin;
+        p1 = p1_begin + 1;
     }
+    return 0;
+}
 
-    printf("Pico W IRQ & State Machine Test\n");
+int parse_int(char **str) {
+    int res = 0;
+    while (**str >= '0' && **str <= '9') { res = res * 10 + (**str - '0'); (*str)++; }
+    if (**str == ',') (*str)++;
+    return res;
+}
 
-    // Init UART
-    uart_init(UART_ID, BAUD_RATE);
-    gpio_set_function(UART_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(UART_RX_PIN, GPIO_FUNC_UART);
-    gpio_pull_up(UART_RX_PIN);
-    uart_set_format(UART_ID, 8, 1, UART_PARITY_NONE);
-    uart_set_fifo_enabled(UART_ID, true);
+float parse_float(char **str) {
+    float res = 0.0f; int sign = 1;
+    if (**str == '-') { sign = -1; (*str)++; }
+    while (**str >= '0' && **str <= '9') { res = res * 10.0f + (**str - '0'); (*str)++; }
+    if (**str == '.') {
+        (*str)++; float frac = 0.1f;
+        while (**str >= '0' && **str <= '9') { res += (**str - '0') * frac; frac *= 0.1f; (*str)++; }
+    }
+    if (**str == ',') (*str)++;
+    return res * sign;
+}
 
-    printf("UART initialized. Starting IRQ in 1 second...\n");
-    sleep_ms(1000);
+// ======================================================
+// Task 1: UART Parser
+// ======================================================
+LOCAL void task_uart_parser(INT stacd, void *exinf)
+{
+    char buffer[RX_LINE_SIZE];
+    char pending[32];
+    SZ pending_size = 0;
+    SZ pending_index = 0;
+    UW line_index = 0;
+    BOOL line_overflow = FALSE;
 
-    // 2. Start the IRQ ONLY after USB is fully connected
-    setup_uart_irq(); 
-    printf("IRQ Started. Entering main loop.\n");
+    (void)stacd;
+    (void)exinf;
 
-    // State variables
-    system_state_t state = STATE_SCAN_SHELF;
-    uint32_t state_timer = to_ms_since_boot(get_absolute_time());
-    char buffer[128];
-    int index = 0;
-
-    while (true) {
-        uint32_t now = to_ms_since_boot(get_absolute_time());
-
-        // ==========================================
-        // 1. STATE MACHINE
-        // ==========================================
-        switch (state) {
-            case STATE_SCAN_SHELF:
-                printf("\n[State] SCAN_SHELF: Sending M,S...\n");
-                shelf_count = 0; // Clear old map
-                send_mode_command("M,S\n");
-                sleep_ms(50);
-                send_mode_command("M,S\n");
-                state_timer = now;
-                state = STATE_WAIT_SHELF_RESULTS;
-                break;
-
-            case STATE_WAIT_SHELF_RESULTS:
-                // Wait 5 seconds to gather data
-                if (now - state_timer > 5000) {
-                    printf("[State] Finished Scanning. Found %d objects.\n", shelf_count);
-                    printf("[State] MOVE_TO_PAYLOAD...\n");
-                    state_timer = now;
-                    state = STATE_MOVE_TO_PAYLOAD;
-                }
-                break;
-
-            case STATE_MOVE_TO_PAYLOAD:
-                // Simulate arm movement time (2 seconds)
-                if (now - state_timer > 2000) {
-                    printf("[State] RE_SCAN_PAYLOAD: Sending M,C...\n");
-                    send_mode_command("M,C\n");
-                    sleep_ms(50);
-                    send_mode_command("M,C\n");
-                    state_timer = now;
-                    state = STATE_WAIT_PAYLOAD_RESULTS;
-                }
-                break;
-
-            case STATE_WAIT_PAYLOAD_RESULTS:
-                // Wait 2 seconds for fresh color data
-                if (now - state_timer > 2000) {
-                    printf("[State] EXECUTE_PICK...\n");
-                    state = STATE_EXECUTE_PICK;
-                }
-                break;
-
-            case STATE_EXECUTE_PICK:
-                // Do nothing, wait for user to restart or loop
-                if (now - state_timer > 3000) {
-                    printf("\n--- Restarting Cycle ---\n");
-                    state = STATE_SCAN_SHELF;
-                }
-                break;
-
-            case STATE_FAULT:
-                printf("[FAULT] System halted.\n");
-                state = STATE_IDLE; // Or just loop forever
-                break;
-                
-            default:
-                break;
-        }
-
-        // ==========================================
-        // 2. UART RX PROCESSING (From IRQ Queue)
-        // ==========================================
-                // ==========================================
-        // 2. UART RX PROCESSING (From IRQ Queue)
-        // ==========================================
-        uint8_t ch;
-        if (queue_try_remove(&rx_queue, &ch)) {
-            if (ch == '\n') {
-                buffer[index] = '\0';
-                
-                // Strip \r
-                while (index > 0 && buffer[index-1] == '\r') {
-                    buffer[--index] = '\0';
-                }
-
-                if (index > 0) {
-                    char *start;
-                    
-                    // 1. FIRST, check if it's a packet we care about
-                    if (strstr(buffer, "A,") == NULL && strstr(buffer, "C,") == NULL) {
-                        // It's a boot log or noise, ignore it silently.
-                        // DO NOT use continue; let it fall through to the bottom.
-                    } else {
-                        // 2. It IS a vision packet, now verify the checksum
-                        char *star = strchr(buffer, '*');
-                        bool valid_checksum = false;
-                        
-                        if (star != NULL) {
-                            *star = '\0'; 
-                            
-                            uint8_t expected = 0;
-                            for (char *p = buffer; *p; p++) expected ^= (uint8_t)*p;
-                            
-                            uint8_t received = 0;
-                            sscanf(star + 1, "%hhX", &received);
-
-                            if (expected == received) {
-                                valid_checksum = true;
-                            } else {
-                                printf("[Error] Checksum mismatch!\n");
-                            }
-                        } else {
-                            printf("[Error] Vision packet missing checksum.\n");
-                        }
-
-                        // 3. Parse Data if Checksum is valid
-                        if (valid_checksum) {
-                            char color;
-                            int x = -1, y = -1, id;
-                            float w, dist;
-
-                            if ((start = strstr(buffer, "A,")) != NULL) {
-                                if (sscanf(start, "A,%d,%d,%d,%f,%f", &id, &x, &y, &w, &dist) == 5) {
-                                    if (state == STATE_WAIT_SHELF_RESULTS) {
-                                        
-                                        bool found = false;
-                                        // 1. Check if we already have this marker ID
-                                        for (int i = 0; i < shelf_count; i++) {
-                                            if (shelf_map[i].id == id) {
-                                                // Update the position (average it or just overwrite)
-                                                shelf_map[i].x = x; 
-                                                shelf_map[i].y = y;
-                                                shelf_map[i].distance = dist;
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                        
-                                        // 2. If it's a brand new marker, add it to the array
-                                        if (!found && shelf_count < MAX_OBJECTS) {
-                                            shelf_map[shelf_count].id = id;
-                                            shelf_map[shelf_count].x = x;
-                                            shelf_map[shelf_count].y = y;
-                                            shelf_map[shelf_count].distance = dist;
-                                            shelf_count++;
-                                            printf("  -> NEW ARUCO FOUND! ID:%d (Total: %d)\n", id, shelf_count);
-                                        }
-                                    }
-                                }
-                            }
-                            else if ((start = strstr(buffer, "C,")) != NULL) {
-                                if (state == STATE_WAIT_PAYLOAD_RESULTS) {
-                                    if (sscanf(start, "C,%c,%d,%d", &color, &x, &y) == 3) {
-                                        printf("  -> Payload found: COLOR %c at X:%d Y:%d\n", color, x, y);
-                                    } else if (sscanf(start, "C,%c", &color) == 1) {
-                                        printf("  -> Payload: COLOR %c (No position)\n", color);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                index = 0; // Reset for next packet
-            } 
-            else if (index < sizeof(buffer) - 1) {
-                buffer[index++] = ch;
+    while(1) {
+        ModeCommand command;
+        INT command_size = tk_rcv_mbf(command_mbf_id, &command, TMO_POL);
+        if (command_size == (INT)sizeof(command)) {
+            SZ written = 0;
+            ER write_result = tk_swri_dev(
+                uart_device_id, 0, command.bytes, sizeof(command.bytes), &written);
+            if (write_result < E_OK || written != sizeof(command.bytes)) {
+                tm_printf((UB*)"[UART] command write failed: %d\n", write_result);
             }
         }
 
-        // Yield to prevent CPU starvation
-        tight_loop_contents();
+        if (pending_index >= pending_size) {
+            SZ available = 0;
+            ER read_result = tk_srea_dev(uart_device_id, 0, NULL, 0, &available);
+            if (read_result < E_OK || available == 0) {
+                tk_dly_tsk(1);
+                continue;
+            }
+
+            pending_size = available < sizeof(pending) ? available : sizeof(pending);
+            pending_index = 0;
+            read_result = tk_srea_dev(
+                uart_device_id, 0, pending, pending_size, &pending_size);
+            if (read_result < E_OK || pending_size == 0) {
+                pending_size = pending_index = 0;
+                tk_dly_tsk(1);
+                continue;
+            }
+        }
+
+        INT msgsz = 0;
+        while (pending_index < pending_size) {
+            char ch = pending[pending_index++];
+            if (ch == '\n') {
+                if (!line_overflow) {
+                    buffer[line_index] = '\0';
+                    msgsz = (INT)(line_index + 1U);
+                }
+                line_index = 0;
+                line_overflow = FALSE;
+                if (msgsz > 0) break;
+            } else if (line_index < RX_LINE_SIZE - 1U) {
+                buffer[line_index++] = ch;
+            } else {
+                line_overflow = TRUE;
+            }
+        }
+        if (msgsz <= 0) continue;
+
+        if (msgsz > 0) {
+            int idx = my_strlen(buffer);
+            while (idx > 0 && buffer[idx-1] == '\r') { buffer[--idx] = '\0'; }
+
+            // Ignore boot logs
+            if (my_strstr(buffer, "A,") == NULL && my_strstr(buffer, "C,") == NULL) continue;
+
+            char *star = my_strchr(buffer, '*');
+            if (star != NULL) {
+                *star = '\0';
+
+                // Verify Checksum
+                UB expected = 0;
+                for (char *p = buffer; *p; p++) expected ^= (UB)*p;
+
+                int received = 0;
+                char *cksum_str = star + 1;
+                while (*cksum_str) {
+                    int val = 0;
+                    if (*cksum_str >= '0' && *cksum_str <= '9') val = *cksum_str - '0';
+                    else if (*cksum_str >= 'A' && *cksum_str <= 'F') val = *cksum_str - 'A' + 10;
+                    else if (*cksum_str >= 'a' && *cksum_str <= 'f') val = *cksum_str - 'a' + 10;
+                    else break;
+                    received = (received << 4) | val;
+                    cksum_str++;
+                }
+
+                if (expected == received) {
+                    char *start;
+                    if ((start = my_strstr(buffer, "A,")) != NULL) {
+                        start += 2; // Skip "A,"
+                        int id = parse_int(&start);
+                        int x = parse_int(&start);
+                        int y = parse_int(&start);
+                        (void)parse_float(&start);
+                        float dist = parse_float(&start);
+
+                        INT total;
+                        BOOL new_object = FALSE;
+                        if (tk_loc_mtx(mtx_id, TMO_FEVR) < E_OK) continue;
+                        int found = 0;
+                        for (int i = 0; i < shelf_count; i++) {
+                            if (shelf_map[i].id == id) {
+                                shelf_map[i].x = x; shelf_map[i].y = y; shelf_map[i].distance = dist;
+                                found = 1; break;
+                            }
+                        }
+                        if (!found && shelf_count < MAX_OBJECTS) {
+                            shelf_map[shelf_count].id = id;
+                            shelf_map[shelf_count].x = x;
+                            shelf_map[shelf_count].y = y;
+                            shelf_map[shelf_count].distance = dist;
+                            shelf_count++;
+                            new_object = TRUE;
+                        }
+                        total = shelf_count;
+                        (void)tk_unl_mtx(mtx_id);
+                        if (new_object) {
+                            tm_printf((UB*)"  -> NEW ARUCO FOUND! ID:%d (Total: %d)\n",
+                                      id, total);
+                        }
+                    } else if ((start = my_strstr(buffer, "C,")) != NULL) {
+                        start += 2; // Skip "C,"
+                        char color = *start; start += 2; // Skip color and comma
+                        int x = parse_int(&start);
+                        int y = parse_int(&start);
+                        tm_printf((UB*)"  -> Payload found: COLOR %c at X:%d Y:%d\n", color, x, y);
+                    }
+                } else {
+                    tm_printf((UB*)"[Error] Checksum mismatch!\n");
+                }
+            }
+        }
+    }
+}
+
+// ======================================================
+// Task 2: State Machine
+// ======================================================
+LOCAL void task_state_machine(INT stacd, void *exinf)
+{
+    while(1) {
+        tm_printf((UB*)"\n[State] SCAN_SHELF: Sending M,S...\n");
+        tk_loc_mtx(mtx_id, TMO_FEVR); shelf_count = 0; tk_unl_mtx(mtx_id);
+
+        send_mode_command("M,S\n");
+        tk_dly_tsk(50);
+        send_mode_command("M,S\n");
+
+        // Wait 5 seconds for scan
+        tk_dly_tsk(5000);
+
+        tk_loc_mtx(mtx_id, TMO_FEVR);
+        INT scanned_object_count = shelf_count;
+        tk_unl_mtx(mtx_id);
+        tm_printf((UB*)"[State] Finished Scanning. Found %d objects.\n",
+                  scanned_object_count);
+
+        tm_printf((UB*)"[State] MOVE_TO_PAYLOAD...\n");
+        tk_dly_tsk(2000); // Wait 2s
+
+        tm_printf((UB*)"[State] RE_SCAN_PAYLOAD: Sending M,C...\n");
+        send_mode_command("M,C\n");
+        tk_dly_tsk(50);
+        send_mode_command("M,C\n");
+
+        tk_dly_tsk(2000); // Wait 2s
+
+        tm_printf((UB*)"[State] EXECUTE_PICK...\n");
+        tk_dly_tsk(3000); // Wait 3s before restart
+    }
+}
+
+// ======================================================
+// Entry Point (Called by μT-Kernel)
+// ======================================================
+EXPORT INT usermain(void)
+{
+    tm_printf((UB*)"Pico W vision app on micro T-Kernel SMP starting...\n");
+
+    /* The BSP registers UART0 as "sera" and routes GP0/GP1 to it.  T-Monitor
+     * is built USB-only for this app so it does not share the vision UART. */
+    uart_device_id = tk_opn_dev((const UB*)"sera", TD_UPDATE);
+    if (uart_device_id <= E_OK) {
+        tm_printf((UB*)"[init] cannot open UART0 device: %d\n", uart_device_id);
+        return 0;
     }
 
+    command_mbf_id = tk_cre_mbf(&cmbf);
+    mtx_id = tk_cre_mtx(&cmtx);
+    if (command_mbf_id <= E_OK || mtx_id <= E_OK) {
+        tm_printf((UB*)"[init] kernel object creation failed: mbf=%d mtx=%d\n",
+                  command_mbf_id, mtx_id);
+        return 0;
+    }
+
+    task_uart_id = tk_cre_tsk(&ctsk_uart);
+    if (task_uart_id <= E_OK || tk_sta_tsk(task_uart_id, 0) < E_OK) {
+        tm_printf((UB*)"[init] UART task creation/start failed: %d\n", task_uart_id);
+        return 0;
+    }
+    task_state_id = tk_cre_tsk(&ctsk_state);
+    if (task_state_id <= E_OK || tk_sta_tsk(task_state_id, 0) < E_OK) {
+        tm_printf((UB*)"[init] state task creation/start failed: %d\n", task_state_id);
+        return 0;
+    }
+
+    /* Match the μT-Kernel BSP demo: keep the initial task asleep while the
+     * two application tasks run. */
+    tk_slp_tsk(TMO_FEVR);
     return 0;
 }
