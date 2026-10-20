@@ -1,7 +1,7 @@
 #include "cli.h"
 
 #include <ctype.h>
-#include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 
 #define CLI_MAX_TOKENS 4   /* one more than any command needs, to detect extras */
@@ -54,9 +54,29 @@ static int tokenize(char *buf, char *tok[], int max_tok) {
     return n;
 }
 
-static void set_reply(char *reply, size_t len, const char *fmt, const char *a, int n) {
+/* Reply building without stdio: snprintf pulls in newlib's stdio, which
+   needs OS hooks (_isatty, _write...) that the µT-Kernel port does not
+   provide. These helpers keep cli.c freestanding on bare-metal, FreeRTOS
+   and µT-Kernel alike. */
+
+/* Concatenate NULL-terminated string arguments into reply, truncating safely. */
+static void set_reply(char *reply, size_t len, ...) {
     if (!reply || len == 0) return;
-    snprintf(reply, len, fmt, a, n);
+    size_t used = 0;
+    va_list ap;
+    va_start(ap, len);
+    for (const char *s = va_arg(ap, const char *); s; s = va_arg(ap, const char *))
+        while (*s && used < len - 1) reply[used++] = *s++;
+    va_end(ap);
+    reply[used] = '\0';
+}
+
+/* Unsigned integer to decimal text; buf needs 11 bytes. */
+static const char *num_text(unsigned v, char buf[11]) {
+    char *p = buf + 10;
+    *p = '\0';
+    do { *--p = (char)('0' + v % 10); v /= 10; } while (v);
+    return p;
 }
 
 /* ------------------------------------------------------------------ */
@@ -111,7 +131,9 @@ cli_result_t cli_parse_line(const char *line, cmd_msg_t *out,
     if (reply && reply_len) reply[0] = '\0';
 
     if (strlen(line) > CLI_LINE_MAX) {
-        set_reply(reply, reply_len, "error: line too long%s (max %d chars)", "", CLI_LINE_MAX);
+        char nb[11];
+        set_reply(reply, reply_len, "error: line too long (max ",
+                  num_text(CLI_LINE_MAX, nb), " chars)", NULL);
         return CLI_ERR_TOO_LONG;
     }
 
@@ -131,13 +153,13 @@ cli_result_t cli_parse_line(const char *line, cmd_msg_t *out,
         if (word_eq(tok[0], CMDS[i].word)) { def = &CMDS[i]; break; }
 
     if (!def) {
-        set_reply(reply, reply_len, "error: unknown command '%s' (try: help)", tok[0], 0);
+        set_reply(reply, reply_len, "error: unknown command '", tok[0], "' (try: help)", NULL);
         return CLI_ERR_UNKNOWN;
     }
 
     int want = (def->args == ARG_NONE) ? 0 : (def->args == ARG_COLOUR) ? 1 : 2;
     if (n - 1 != want) {
-        set_reply(reply, reply_len, "usage: %s", def->usage, 0);
+        set_reply(reply, reply_len, "usage: ", def->usage, NULL);
         return CLI_ERR_ARGS;
     }
 
@@ -146,25 +168,27 @@ cli_result_t cli_parse_line(const char *line, cmd_msg_t *out,
     if (def->args != ARG_NONE) {
         m.colour = parse_colour(tok[1]);
         if (!m.colour) {
-            set_reply(reply, reply_len, "error: colour '%s' must be R, G or B", tok[1], 0);
+            set_reply(reply, reply_len, "error: colour '", tok[1], "' must be R, G or B", NULL);
             return CLI_ERR_COLOUR;
         }
     }
     if (def->args == ARG_COLOUR_ID) {
         if (!parse_id(tok[2], CLI_MAX_MARKER_ID, &m.value)) {
-            set_reply(reply, reply_len, "error: marker id '%s' must be a whole number 0-%d",
-                      tok[2], CLI_MAX_MARKER_ID);
+            char nb[11];
+            set_reply(reply, reply_len, "error: marker id '", tok[2],
+                      "' must be a whole number 0-", num_text(CLI_MAX_MARKER_ID, nb), NULL);
             return CLI_ERR_ID;
         }
     }
 
     if (out) *out = m;
 
-    if (reply && reply_len) {
-        if (def->args == ARG_NONE)        snprintf(reply, reply_len, "ok: %s", def->word);
-        else if (def->args == ARG_COLOUR) snprintf(reply, reply_len, "ok: %s %c", def->word, m.colour);
-        else snprintf(reply, reply_len, "ok: %s %c %d", def->word, m.colour, m.value);
-    }
+    char col[2] = { m.colour, '\0' };
+    char nb[11];
+    if (def->args == ARG_NONE)        set_reply(reply, reply_len, "ok: ", def->word, NULL);
+    else if (def->args == ARG_COLOUR) set_reply(reply, reply_len, "ok: ", def->word, " ", col, NULL);
+    else set_reply(reply, reply_len, "ok: ", def->word, " ", col, " ",
+                   num_text((unsigned)m.value, nb), NULL);
     return CLI_OK;
 }
 
