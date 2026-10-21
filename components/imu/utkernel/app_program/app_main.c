@@ -13,6 +13,7 @@
 #endif
 
 #define MONITOR_STACK 4096
+#define IMU_SHOW_RAW 0
 
 static ID i2c_shared_mutex = 0;
 
@@ -68,12 +69,12 @@ static void monitor_task(
 
     (void)tk_dly_tsk(300);
 
+    
     tm_printf(
-        (UB *)"\n=== AAI17 IMU / uT-Kernel 3 SMP ===\n"
-    );
-
-    tm_printf(
-        (UB *)"*** IMU DEBUG VERSION 2 ***\n"
+        (UB *)"\n========================================\n"
+            "  AAI17 | MPU-6500 ORIENTATION MONITOR\n"
+            "========================================\n"
+            "Tolerance: +/- 5 degrees\n\n"
     );
 
 #if TK_SUPPORT_SMP
@@ -132,20 +133,57 @@ static void monitor_task(
                 );
             }
 
-            else if (
-                result.event == IMU_EVT_FAULT
-            ) {
-                tm_printf(
-                    (UB *)"[IMU] FAULT request=%u "
-                           "valid=%d gap=%ums\n",
-                    result.request_id,
-                    result.sample.valid,
-                    result.sample.interval_ms
-                );
+            
+            else if (result.event == IMU_EVT_FAULT) {
 
-                if (result.request_id ==
-                    expected_request) {
+                UW gap = result.sample.interval_ms;
+
+                /* Fault during orientation verification */
+                if (verification_pending &&
+                    result.request_id == expected_request) {
+
+                    tm_printf(
+                        (UB *)"[CHECK #%u] FAULT - "
+                            "VERIFICATION BLOCKED\n"
+                            "           Sensor data unreliable. "
+                            "Orientation NOT approved.\n",
+                        result.request_id
+                    );
+
                     verification_pending = 0;
+                }
+
+                /* Invalid requested snapshot */
+                else if (result.request_id != 0) {
+
+                    tm_printf(
+                        (UB *)"[IMU] WARNING - "
+                            "Snapshot #%u unavailable "
+                            "(invalid reading)\n",
+                        result.request_id
+                    );
+                }
+
+                /* Sampling deadline exceeded */
+                else if (gap > 50U) {
+
+                    tm_printf(
+                        (UB *)"[IMU] WARNING - "
+                            "Sampling delay: %ums "
+                            "(limit 50ms)\n",
+                        gap
+                    );
+                }
+
+                /* Other invalid sensor readings */
+                else {
+
+                    tm_printf(
+                        (UB *)"[IMU] WARNING - "
+                            "Invalid sensor reading\n"
+                            "      Possible rapid movement "
+                            "or I2C communication issue.\n"
+                    );
                 }
             }
 
@@ -172,48 +210,66 @@ static void monitor_task(
                         result.sample.roll_deg;
 
                     has_reference = 1;
+                    
+                    tm_printf(
+                        (UB *)"\n[TARGET] "
+                    );
+
+                    print_angle(
+                        "Pitch",
+                        reference_pitch
+                    );
+
+                    print_angle(
+                        "Roll",
+                        reference_roll
+                    );
 
                     tm_printf(
-                        (UB *)"[DEMO] Reference saved.\n"
+                        (UB *)"(reference saved)\n"
                     );
                 }
+                                    
+                    /* Clean orientation output */
+                    tm_printf(
+                        (UB *)"\n[DATA] "
+                    );
 
-                tm_printf(
-                    (UB *)"[prc%d -> prc%d] ",
-                    result.producer_core,
-                    CURRENT_CORE()
-                );
+                    print_angle(
+                        "Pitch",
+                        result.sample.pitch_deg
+                    );
 
-                print_angle(
-                    "Pitch",
-                    result.sample.pitch_deg
-                );
+                    print_angle(
+                        "Roll",
+                        result.sample.roll_deg
+                    );
 
-                print_angle(
-                    "Roll",
-                    result.sample.roll_deg
-                );
+                    tm_printf(
+                        (UB *)"\n       %s | %s | %ums | Time=%ums\n",
+                        result.sample.stationary
+                            ? (UB *)"STILL "
+                            : (UB *)"MOVING",
+                        result.sample.valid
+                            ? (UB *)"Valid"
+                            : (UB *)"INVALID",
+                        result.sample.interval_ms,
+                        result.sample.timestamp_ms
+                    );
 
-                tm_printf(
-                    (UB *)"Gap=%ums Valid=%d Still=%d Time=%ums\n",
-                    result.sample.interval_ms,
-                    result.sample.valid,
-                    result.sample.stationary,
-                    result.sample.timestamp_ms
-                );
-
-
-                tm_printf(
-                    (UB *)"RAW: AX=%d AY=%d AZ=%d "
-                        "GX=%d GY=%d GZ=%d\n",
-                    result.sample.raw_ax,
-                    result.sample.raw_ay,
-                    result.sample.raw_az,
-                    result.sample.raw_gx,
-                    result.sample.raw_gy,
-                    result.sample.raw_gz
-                );
-
+                    /* Optional raw debugging output */
+                    #if IMU_SHOW_RAW
+                    tm_printf(
+                        (UB *)"       RAW: AX=%d AY=%d AZ=%d "
+                            "GX=%d GY=%d GZ=%d\n",
+                        result.sample.raw_ax,
+                        result.sample.raw_ay,
+                        result.sample.raw_az,
+                        result.sample.raw_gx,
+                        result.sample.raw_gy,
+                        result.sample.raw_gz
+                    );
+                    #endif
             }
 
             else if (
@@ -242,26 +298,26 @@ static void monitor_task(
                             IMU_EVT_VERIFIED &&
                         fresh
                     ) {
-                        status = "PASS";
+                        status = "PASS - WITHIN TOLERANCE";
                     }
 
                     else if (
                         result.event ==
                             IMU_EVT_OUT_OF_TOLERANCE
                     ) {
-                        status = "OUT OF TOLERANCE";
+                        status = "FAIL - OUT OF TOLERANCE";
                     }
 
                     else {
                         status = "REJECTED (STALE)";
                     }
 
+                    
                     tm_printf(
-                        (UB *)"[VERIFY #%u] %s "
-                               "fresh=%d\n",
+                        (UB *)"\n[CHECK #%u] %s | %s\n",
                         result.request_id,
                         (UB *)status,
-                        fresh
+                        fresh ? (UB *)"FRESH" : (UB *)"STALE"
                     );
 
                     verification_pending = 0;

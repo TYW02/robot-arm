@@ -108,45 +108,81 @@ LOCAL void i2c_inthdr( UINT intno )
 	if(i2c_sts & I2C_INT_ERROR) abort = TRUE;
 
 	if(!abort) {
-	switch ( p_cb->state ) {
+	switch (p_cb->state) {
+
 	case I2C_STS_SEND:
-		if(i2c_sts & I2C_INT_TX_EMPTY) {
+		if (i2c_sts & I2C_INT_TX_EMPTY) {
+
 			cmd = *(p_cb->sbuf)++ & I2C_DATA_CMD_DAT;
-			if(--(p_cb->sdat_num)) {
+
+			if (--(p_cb->sdat_num)) {
 				cmd |= I2C_DATA_CMD_CMD_WRITE;
-			} else {	// Last data
+			} else {
 				clr_w(I2C_INTR_MASK(unit), I2C_INT_TX_EMPTY);
-				if(p_cb->rdat_num) {
-					cmd |= I2C_DATA_CMD_CMD_WRITE | I2C_DATA_CMD_RESTART;
+
+				if (p_cb->rdat_num) {
+					cmd |= I2C_DATA_CMD_CMD_WRITE;
 					p_cb->state = I2C_STS_START;
+					wup = TRUE;
 				} else {
-					cmd |= I2C_DATA_CMD_CMD_WRITE | I2C_DATA_CMD_STOP;
+					cmd |= I2C_DATA_CMD_CMD_WRITE |
+						I2C_DATA_CMD_STOP;
+
 					p_cb->state = I2C_STS_STOP;
+
+					set_w(I2C_INTR_MASK(unit),
+						I2C_INT_STOP_DET);
 				}
-				wup = TRUE;
 			}
-			out_w(I2C_DATA_CMD(unit), cmd);			
-		} else {	// Error
-			abort = TRUE;	// Error
+
+			out_w(I2C_DATA_CMD(unit), cmd);
+
+		} else {
+			abort = TRUE;
 		}
 		break;
+
 	case I2C_STS_RECV:
-		if(i2c_sts & I2C_INT_RX_FULL) {
-			*(p_cb->rbuf)++ = in_w(I2C_DATA_CMD(unit)) & I2C_DATA_CMD_DAT;
-			if(--(p_cb->rdat_num)) {
+		if (i2c_sts & I2C_INT_RX_FULL) {
+
+			*(p_cb->rbuf)++ =
+				in_w(I2C_DATA_CMD(unit)) &
+				I2C_DATA_CMD_DAT;
+
+			if (--(p_cb->rdat_num)) {
+
 				cmd = I2C_DATA_CMD_CMD_READ;
+
+				if (p_cb->rdat_num == 1) {
+					cmd |= I2C_DATA_CMD_STOP;
+				}
+
 				out_w(I2C_DATA_CMD(unit), cmd);
-			} else {	// Last data
-				clr_w(I2C_INTR_MASK(unit), I2C_INT_RX_FULL);
+
+			} else {
+				clr_w(I2C_INTR_MASK(unit),
+					I2C_INT_RX_FULL);
+
 				p_cb->state = I2C_STS_STOP;
 				wup = TRUE;
 			}
+
 		} else {
-			abort = TRUE;	// Error
+			abort = TRUE;
 		}
 		break;
+
+	case I2C_STS_STOP:
+		if (i2c_sts & I2C_INT_STOP_DET) {
+			wup = TRUE;
+		} else {
+			abort = TRUE;
+		}
+		break;
+
 	default:
-		abort = TRUE;	// Error
+		abort = TRUE;
+		break;
 	}
 	}
 
@@ -191,16 +227,26 @@ LOCAL ER i2c_trans(INT unit, T_I2C_LLDCB *p_cb)
 		if(p_cb->sdat_num > 0 ) {	/* Send */
 			set_w(I2C_INTR_MASK(unit), I2C_INT_TX_EMPTY|I2C_INT_ERROR);
 			p_cb->state = I2C_STS_SEND;
-		} else {			/* Receive */
-			if(p_cb->rdat_num > 1) {
+		
+		} else {            /* Receive */
+			if (p_cb->rdat_num > 1) {
 				cmd = I2C_DATA_CMD_CMD_READ;
-			} else {	// Last data
+			} else {
 				cmd = I2C_DATA_CMD_CMD_READ | I2C_DATA_CMD_STOP;
 			}
-			set_w(I2C_INTR_MASK(unit), I2C_INT_RX_FULL|I2C_INT_ERROR);
-			out_w(I2C_DATA_CMD(unit), cmd);				
+
+			// Repeated START when reading after a register-address write
+			if (p_cb->sbuf != NULL) {
+				cmd |= I2C_DATA_CMD_RESTART;
+			}
+
+			set_w(I2C_INTR_MASK(unit),
+				I2C_INT_RX_FULL | I2C_INT_ERROR);
+
+			out_w(I2C_DATA_CMD(unit), cmd);
 			p_cb->state = I2C_STS_RECV;
 		}
+
 		I2C_UNLOCK(unit, imask);
 
 		if(p_cb->ioerr != E_OK) {

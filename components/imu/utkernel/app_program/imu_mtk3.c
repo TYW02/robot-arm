@@ -38,6 +38,11 @@ static float roll_deg = 0;
 static UW last_ms = 0;
 static INT filter_valid = 0;
 
+/* Detect repeated identical sensor readings. */
+static H previous_raw[6];
+static INT previous_raw_available = 0;
+static UINT identical_raw_count = 0;
+
 /* -------------------------------------
  * Time
  * ------------------------------------- */
@@ -228,6 +233,8 @@ ER imu_mtk3_init(
     float magnitude;
 
     filter_valid = 0;
+    previous_raw_available = 0;
+    identical_raw_count = 0;
     shared_mutex = shared_i2c_mutex;
 
     if (shared_mutex <= 0) {
@@ -260,7 +267,7 @@ ER imu_mtk3_init(
         return E_IO;
     }
 
-    /* Wake up the sensor. */
+    /* Wake up the MPU-6500. */
     if (!put_register(
             PWR_MGMT_1,
             0x01
@@ -268,7 +275,29 @@ ER imu_mtk3_init(
         return E_IO;
     }
 
+    /* Give the sensor time to wake up. */
     (void)tk_dly_tsk(100);
+
+    /* Read back the power management register. */
+    UB power_state = 0xFF;
+
+    if (!get_registers(
+            PWR_MGMT_1,
+            &power_state,
+            1
+        )) {
+        return E_IO;
+    }
+
+    /* Check that sleep mode is disabled. */
+    if ((power_state & 0x40U) != 0) {
+        return E_IO;
+    }
+
+    /* Check that the clock source is set correctly. */
+    if ((power_state & 0x07U) != 0x01U) {
+        return E_IO;
+    }
 
     /* +/-2g accelerometer, +/-250 dps gyro. */
     if (!put_register(ACCEL_CONFIG, 0x00) ||
@@ -357,6 +386,36 @@ INT imu_mtk3_read(
     out->raw_gx = gx;
     out->raw_gy = gy;
     out->raw_gz = gz;
+
+    /* Compare all six raw sensor readings. */
+    H current_raw[6] = {
+        ax, ay, az, gx, gy, gz
+    };
+
+    if (previous_raw_available &&
+        memcmp(previous_raw,
+            current_raw,
+            sizeof(current_raw)) == 0) {
+
+        identical_raw_count++;
+
+    } else {
+        identical_raw_count = 0;
+    }
+
+    /* Save the current readings for next time. */
+    memcpy(previous_raw,
+        current_raw,
+        sizeof(current_raw));
+
+    previous_raw_available = 1;
+
+    /* Reject potentially frozen sensor data. */
+    if (identical_raw_count >= 10U) {
+        filter_valid = 0;
+        out->valid = 0;
+        return 0;
+    }
 
     // Calculate pitch and roll
     if (!accel_angles(
