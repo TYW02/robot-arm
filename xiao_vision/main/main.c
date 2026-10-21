@@ -6,6 +6,7 @@
 #include "esp_camera.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 // ======================================================
 // UART (to Pico W)
@@ -314,12 +315,30 @@ static void uart_rx_task(void *arg)
 }
 
 
+// Helper to calculate XOR checksum and append it
+static void send_with_checksum(const char* format, ...) {
+    char tx_buffer[64];
+    va_list args;
+    va_start(args, format);
+    int len = vsnprintf(tx_buffer, sizeof(tx_buffer), format, args);
+    va_end(args);
+
+    // Calculate XOR checksum
+    uint8_t checksum = 0;
+    for (int i = 0; i < len; i++) {
+        checksum ^= (uint8_t)tx_buffer[i];
+    }
+
+    len += snprintf(tx_buffer + len, sizeof(tx_buffer) - len, "*%02X\n", checksum);
+    uart_write_bytes(VISION_UART_NUM, tx_buffer, len);
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Starting color detection...");
     init_uart();
 
-    xTaskCreate(uart_rx_task, "uart_rx", 4096, NULL, 5, NULL);
+    xTaskCreate(uart_rx_task, "uart_rx", 8192, NULL, 5, NULL);
 
     if (init_camera() != ESP_OK) {
         ESP_LOGE(TAG, "Camera failed, halting");
@@ -333,68 +352,62 @@ void app_main(void)
     uint32_t last_send_ms = 0;
 
     while (1) {
-            camera_fb_t *fb = esp_camera_fb_get();
+        camera_fb_t *fb = esp_camera_fb_get();
 
-            if (!fb) {
-                ESP_LOGW(TAG, "Frame capture failed");
-                vTaskDelay(pdMS_TO_TICKS(50));
-                continue;
+        if (!fb) {
+            ESP_LOGW(TAG, "Frame capture failed");
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Branch based on mode (MODE_SCAN / MODE_COLOR)
+        if (g_mode == MODE_SCAN) {
+            // Aruco Scanning
+            aruco_result_t res = aruco_detect_frame(fb);
+
+            if (res.detected) {
+                // Send using the checksum helper (no uart_write_bytes needed)
+                send_with_checksum("A,%d,%d,%d,%.1f,%.1f",
+                                res.marker_id, (int)res.cx, (int)res.cy, res.width_px, res.distance_mm);
             }
+        } else if (g_mode == MODE_COLOR) {
+            // COLOR DETECTION
+            detection_t det = detect_dominant_color(fb);
 
-                // Branch based on mode (MODE_SCAN / MODE_COLOR)
-            if (g_mode == MODE_SCAN) {
-                // Aruco Scanning
-                aruco_result_t res = aruco_detect_frame(fb);
+            // Push into history
+            history[history_idx] = det;
+            history_idx = (history_idx + 1) % HISTORY_LEN;
 
-                if (res.detected) {
-                    char tx_buffer[48];
-                    int len = snprintf(tx_buffer, sizeof(tx_buffer),
-                                    "A,%d,%d,%d,%.1f,%.1f\n",
-                                    res.marker_id, (int)res.cx, (int)res.cy, res.width_px, res.distance_mm);
-                    uart_write_bytes(VISION_UART_NUM, tx_buffer, len);
+            detection_t consensus = history_consensus();
+            uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+            // Send if the color changed, position moved significantly, or it's been 1s
+            bool color_changed = (consensus.color != last_sent_color);
+            bool moved_far     = (abs(consensus.x - last_sent_x) > 10) ||
+                                (abs(consensus.y - last_sent_y) > 10);
+            bool stale         = (now_ms - last_send_ms) > 1000;
+
+            if (color_changed || moved_far || stale) {
+                const char *name = (consensus.color == COLOR_RED)   ? "R"
+                                : (consensus.color == COLOR_GREEN) ? "G"
+                                : (consensus.color == COLOR_BLUE)  ? "B"
+                                : "N";
+
+                if (consensus.color == COLOR_NONE || consensus.x < 0) {
+                    // Send using the checksum helper
+                    send_with_checksum("C,N");
+                } else {
+                    // Send using the checksum helper
+                    send_with_checksum("C,%s,%d,%d", name, consensus.x, consensus.y);
                 }
-            } else if (g_mode == MODE_COLOR) {
-                // COLOR DETECTION
-                detection_t det = detect_dominant_color(fb);
-                
 
-                // Push into history
-                history[history_idx] = det;
-                history_idx = (history_idx + 1) % HISTORY_LEN;
-
-                detection_t consensus = history_consensus();
-                uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-
-                // Send if the color changed, position moved significantly, or it's been 1s
-                bool color_changed = (consensus.color != last_sent_color);
-                bool moved_far     = (abs(consensus.x - last_sent_x) > 10) ||
-                                    (abs(consensus.y - last_sent_y) > 10);
-                bool stale         = (now_ms - last_send_ms) > 1000;
-
-                if (color_changed || moved_far || stale) {
-                    const char *name = (consensus.color == COLOR_RED)   ? "R"
-                                    : (consensus.color == COLOR_GREEN) ? "G"
-                                    : (consensus.color == COLOR_BLUE)  ? "B"
-                                    : "N";
-
-                    char tx_buffer[32];
-                    int len;
-                    if (consensus.color == COLOR_NONE || consensus.x < 0) {
-                        len = snprintf(tx_buffer, sizeof(tx_buffer), "C,N\n");
-                    } else {
-                        len = snprintf(tx_buffer, sizeof(tx_buffer),
-                                    "C,%s,%d,%d\n", name, consensus.x, consensus.y);
-                    }
-                    uart_write_bytes(VISION_UART_NUM, tx_buffer, len);
-                    
-                    last_sent_color = consensus.color;
-                    last_sent_x = consensus.x;
-                    last_sent_y = consensus.y;
-                    last_send_ms = now_ms;
-                }
+                last_sent_color = consensus.color;
+                last_sent_x = consensus.x;
+                last_sent_y = consensus.y;
+                last_send_ms = now_ms;
             }
+        }
 
-            
         esp_camera_fb_return(fb);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
