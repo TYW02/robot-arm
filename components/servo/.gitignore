@@ -1,2 +1,8 @@
 build
 !.vscode/*
+third_party/mtk3smp-rp2040/build_make/mtkernel_3/**/*.o
+third_party/mtk3smp-rp2040/build_make/mtkernel_3/**/*.d
+third_party/mtk3smp-rp2040/build_make/*.elf
+third_party/mtk3smp-rp2040/build_make/*.map
+third_party/mtk3smp-rp2040/build_make/*.uf2
+third_party/mtk3smp-rp2040/build_make/.build_profile

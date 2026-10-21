@@ -1,562 +1,174 @@
-#include <stdio.h>
-#include <stdint.h>
+/*
+ * INF2004 robot-arm application for the micro T-Kernel 3 SMP RP2040 port.
+ *
+ * Processor 1 is physical RP2040 core 0 and owns peripheral interrupts.
+ * The motion task is therefore pinned to processor 1. The coordinator is
+ * pinned to processor 2 so sequencing work cannot disturb I2C IRQ ownership.
+ * A future IMU task must also use processor 1 and the same I2C mutex below.
+ */
+#include <tk/tkernel.h>
+#include <tk/device.h>
+#include <tm/tmonitor.h>
+#include <stdbool.h>
 
-#include "pico/stdlib.h"
-#include "hardware/i2c.h"
+#if TK_SUPPORT_SMP
+#include <tk/smp.h>
+#endif
 
-// ============================================================
-// I2C / PCA9685
-// ============================================================
+#include "robot_arm.h"
 
-#define I2C_PORT       i2c1
-#define SDA_PIN        2
-#define SCL_PIN        3
+#define TASK_STACK_SIZE       4096
+#define MOTION_QUEUE_DEPTH       4
+#define REPORT_QUEUE_DEPTH       4
+#define POSE_HOLD_MS          3000
 
-#define PCA9685_ADDR   0x40
+/* Message-buffer storage includes one UW of kernel bookkeeping per message. */
+static UW motion_command_storage[
+    (MOTION_QUEUE_DEPTH * sizeof(MotionCommand) + sizeof(UW) - 1) / sizeof(UW)
+    + MOTION_QUEUE_DEPTH
+];
+static UW motion_report_storage[
+    (REPORT_QUEUE_DEPTH * sizeof(MotionReport) + sizeof(UW) - 1) / sizeof(UW)
+    + REPORT_QUEUE_DEPTH
+];
 
-#define MODE1          0x00
-#define MODE2          0x01
-#define LED0_ON_L      0x06
-#define PRESCALE       0xFE
+static ID i2c_mutex_id;
+static ID motion_command_mbf_id;
+static ID motion_report_mbf_id;
+static ID i2c_device_id;
+static ID motion_api_mutex_id;
 
-
-// ============================================================
-// PCA9685 servo channels
-// ============================================================
-
-#define BASE_CH          0
-#define SHOULDER_CH      1
-#define ELBOW_CH         2
-
-#define GRIPPER_CH      13
-#define WRIST_ROTATE_CH 14
-#define WRIST_PITCH_CH  15
-
-
-// ============================================================
-// SAFE SOFTWARE LIMITS
-//
-// These are intentionally inside your measured extremes.
-// Change them later if your testing proves a larger range is safe.
-// ============================================================
-
-// Base measured approximately 400 - 2800 us
-#define BASE_MIN_US          500
-#define BASE_MAX_US         2600
-
-// Shoulder measured approximately 1250 - 2500 us
-#define SHOULDER_MIN_US     1300
-#define SHOULDER_MAX_US     2450
-
-// Elbow measured approximately 1000/1100 - 2600 us
-#define ELBOW_MIN_US        1100
-#define ELBOW_MAX_US        2500
-
-// Wrist pitch measured approximately 450 - 1900 us
-#define WRIST_PITCH_MIN_US   500
-#define WRIST_PITCH_MAX_US  1850
-
-// Wrist rotate measured approximately 400 - 1450 us
-#define WRIST_ROTATE_MIN_US  400
-#define WRIST_ROTATE_MAX_US 400
-
-// Gripper measured approximately 1400 - 2800 us
-#define GRIPPER_MIN_US      1450
-#define GRIPPER_MAX_US      2700
-
-
-// ============================================================
-// Arm pose structure
-// ============================================================
-
-typedef struct
+static BOOL object_created(const char *name, ID id)
 {
-    int base;
-    int shoulder;
-    int elbow;
-    int wrist_pitch;
-    int wrist_rotate;
-    int gripper;
+    if (id <= E_OK) {
+        tm_printf((UB *)"[init] %s creation/open failed: %d\n", name, id);
+        return FALSE;
+    }
+    return TRUE;
+}
 
-} ArmPose;
+static void coordinator_task(INT start_code, void *extended_info)
+{
+    MotionResult result;
 
+    (void)start_code;
+    (void)extended_info;
 
-// ============================================================
-// Initial HOME pose
-//
-// These are starting values based on your calibration.
-// Verify physically before using a large movement.
-// ============================================================
+    tm_printf((UB *)"\nINF2004 robot arm - micro T-Kernel 3 SMP\n");
+    tm_printf((UB *)"motion/I2C: processor 1; coordinator: processor 2\n");
 
-ArmPose HOME = {
-    .base         = 1450,
-    .shoulder     = 2000,
-    .elbow        = 1800,
-    .wrist_pitch  = 700,
-    .wrist_rotate = 400,   // head motor: keep fixed
-    .gripper      = 2800   // open
+    result = motion_initialize_home();
+    if (result != MOTION_OK) goto fault;
+    tk_dly_tsk(POSE_HOLD_MS);
+
+    while (true) {
+        result = MoveShelfScan();
+        if (result != MOTION_OK) goto fault;
+        tk_dly_tsk(POSE_HOLD_MS);
+
+        result = MoveItemsScan();
+        if (result != MOTION_OK) goto fault;
+        tk_dly_tsk(POSE_HOLD_MS);
+
+        result = MoveShelfScan();
+        if (result != MOTION_OK) goto fault;
+        tk_dly_tsk(POSE_HOLD_MS);
+
+        result = MoveHome();
+        if (result != MOTION_OK) goto fault;
+
+        tm_printf((UB *)"[coordinator] scan sequence complete; repeating\n");
+        tk_dly_tsk(POSE_HOLD_MS);
+    }
+
+fault:
+    tm_printf((UB *)"[coordinator] motion fault: %d\n", result);
+    tk_slp_tsk(TMO_FEVR);
+}
+
+static T_CTSK motion_task_definition = {
+    .itskpri = 5,
+    .stksz = TASK_STACK_SIZE,
+    .task = motion_task,
+#if TK_SUPPORT_SMP
+    .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC,
+    .assprc = TP_PRC1,
+#else
+    .tskatr = TA_HLNG | TA_RNG3,
+#endif
 };
 
-
-// ============================================================
-// Small coordinated test pose
-//
-// Intentionally close to HOME for first testing.
-// ============================================================
-
-ArmPose SCAN_POSE = {
-
-    .base         = 2750,
-
-    .shoulder     = 1700,
-
-    .elbow        = 1500,
-
-    .wrist_pitch  = 800,
-
-    .wrist_rotate = 400, //keep head fixed 
-
-    .gripper      = 2800
+static T_CTSK coordinator_task_definition = {
+    .itskpri = 8,
+    .stksz = TASK_STACK_SIZE,
+    .task = coordinator_task,
+#if TK_SUPPORT_SMP
+    .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC,
+    .assprc = TP_PRC2,
+#else
+    .tskatr = TA_HLNG | TA_RNG3,
+#endif
 };
 
+static T_CMTX i2c_mutex_definition = {
+    .mtxatr = TA_TFIFO | TA_INHERIT,
+};
 
-// ============================================================
-// PCA9685 register write
-// ============================================================
+/* Serialize API callers across the complete command/completion exchange. */
+static T_CMTX motion_api_mutex_definition = {
+    .mtxatr = TA_TFIFO | TA_INHERIT,
+};
 
-void pca_write(uint8_t reg, uint8_t value)
+static T_CMBF motion_command_mbf_definition = {
+    .mbfatr = TA_TFIFO,
+    .bufsz = sizeof(motion_command_storage),
+    .maxmsz = sizeof(MotionCommand),
+    .bufptr = motion_command_storage,
+};
+
+static T_CMBF motion_report_mbf_definition = {
+    .mbfatr = TA_TFIFO,
+    .bufsz = sizeof(motion_report_storage),
+    .maxmsz = sizeof(MotionReport),
+    .bufptr = motion_report_storage,
+};
+
+EXPORT INT usermain(void)
 {
-    uint8_t data[2];
+    ID motion_task_id;
+    ID coordinator_task_id;
 
-    data[0] = reg;
-    data[1] = value;
+    /* The BSP is configured to register RP2040 I2C1 as "iicb" on GP2/GP3. */
+    i2c_device_id = tk_opn_dev((UB *)"iicb", TD_UPDATE | TD_EXCL);
+    if (!object_created("I2C1 device", i2c_device_id)) return 1;
 
-    i2c_write_blocking(
-        I2C_PORT,
-        PCA9685_ADDR,
-        data,
-        2,
-        false
-    );
-}
+    i2c_mutex_id = tk_cre_mtx(&i2c_mutex_definition);
+    if (!object_created("I2C mutex", i2c_mutex_id)) return 1;
 
+    motion_command_mbf_id = tk_cre_mbf(&motion_command_mbf_definition);
+    if (!object_created("motion command buffer", motion_command_mbf_id)) return 1;
 
-// ============================================================
-// PCA9685 initialization
-// Approximately 50 Hz servo PWM
-// ============================================================
+    motion_report_mbf_id = tk_cre_mbf(&motion_report_mbf_definition);
+    if (!object_created("motion report buffer", motion_report_mbf_id)) return 1;
 
-void pca_init(void)
-{
-    // Enter sleep so prescaler can be changed
-    pca_write(MODE1, 0x10);
+    motion_api_mutex_id = tk_cre_mtx(&motion_api_mutex_definition);
+    if (!object_created("motion API mutex", motion_api_mutex_id)) return 1;
 
-    // Approx. 50 Hz assuming nominal 25 MHz PCA9685 oscillator
-    pca_write(PRESCALE, 121);
+    motion_task_id = tk_cre_tsk(&motion_task_definition);
+    if (!object_created("motion task", motion_task_id)) return 1;
+    coordinator_task_id = tk_cre_tsk(&coordinator_task_definition);
+    if (!object_created("coordinator task", coordinator_task_id)) return 1;
 
-    // Totem-pole outputs
-    pca_write(MODE2, 0x04);
-
-    // Wake + auto increment
-    pca_write(MODE1, 0x20);
-
-    sleep_ms(10);
-}
-
-
-// ============================================================
-// Raw servo pulse output
-// ============================================================
-
-void servo_set_us(uint8_t channel, uint16_t pulse_us)
-{
-    // 50 Hz -> 20,000 us period
-    uint16_t count =
-        ((uint32_t)pulse_us * 4096) / 20000;
-
-    uint8_t reg =
-        LED0_ON_L + (4 * channel);
-
-    uint8_t data[5];
-
-    data[0] = reg;
-
-    // ON count = 0
-    data[1] = 0x00;
-    data[2] = 0x00;
-
-    // OFF count = calculated PWM count
-    data[3] = count & 0xFF;
-    data[4] = (count >> 8) & 0x0F;
-
-    i2c_write_blocking(
-        I2C_PORT,
-        PCA9685_ADDR,
-        data,
-        5,
-        false
-    );
-}
-
-
-// ============================================================
-// Clamp helper
-// ============================================================
-
-int clamp_value(
-    int value,
-    int min_value,
-    int max_value
-)
-{
-    if (value < min_value)
-        return min_value;
-
-    if (value > max_value)
-        return max_value;
-
-    return value;
-}
-
-
-// ============================================================
-// Apply software safety limits to pose
-// ============================================================
-
-ArmPose clamp_pose(ArmPose pose)
-{
-    pose.base =
-        clamp_value(
-            pose.base,
-            BASE_MIN_US,
-            BASE_MAX_US
-        );
-
-    pose.shoulder =
-        clamp_value(
-            pose.shoulder,
-            SHOULDER_MIN_US,
-            SHOULDER_MAX_US
-        );
-
-    pose.elbow =
-        clamp_value(
-            pose.elbow,
-            ELBOW_MIN_US,
-            ELBOW_MAX_US
-        );
-
-    pose.wrist_pitch =
-        clamp_value(
-            pose.wrist_pitch,
-            WRIST_PITCH_MIN_US,
-            WRIST_PITCH_MAX_US
-        );
-
-    pose.wrist_rotate =
-        clamp_value(
-            pose.wrist_rotate,
-            WRIST_ROTATE_MIN_US,
-            WRIST_ROTATE_MAX_US
-        );
-
-    pose.gripper =
-        clamp_value(
-            pose.gripper,
-            GRIPPER_MIN_US,
-            GRIPPER_MAX_US
-        );
-
-    return pose;
-}
-
-
-// ============================================================
-// Write complete arm pose
-// ============================================================
-
-void write_pose(ArmPose pose)
-{
-    pose = clamp_pose(pose);
-
-    servo_set_us(
-        BASE_CH,
-        pose.base
+    motion_configure(
+        i2c_device_id, i2c_mutex_id,
+        motion_command_mbf_id, motion_report_mbf_id,
+        motion_api_mutex_id, motion_task_id
     );
 
-    servo_set_us(
-        SHOULDER_CH,
-        pose.shoulder
-    );
+    tk_sta_tsk(motion_task_id, 0);
+    tk_sta_tsk(coordinator_task_id, 0);
 
-    servo_set_us(
-        ELBOW_CH,
-        pose.elbow
-    );
-
-    servo_set_us(
-        WRIST_PITCH_CH,
-        pose.wrist_pitch
-    );
-
-    servo_set_us(
-        WRIST_ROTATE_CH,
-        pose.wrist_rotate
-    );
-
-    servo_set_us(
-        GRIPPER_CH,
-        pose.gripper
-    );
-}
-
-
-// ============================================================
-// Integer interpolation
-//
-// Returns a value between start and end.
-// ============================================================
-
-int interpolate(
-    int start,
-    int end,
-    int step,
-    int total_steps
-)
-{
-    return start +
-           ((end - start) * step)
-           / total_steps;
-}
-
-
-// ============================================================
-// Smooth coordinated movement
-//
-// All joints progressively move toward their target together.
-// ============================================================
-
-void move_arm_smooth(
-    ArmPose start,
-    ArmPose target,
-    int steps,
-    int delay_ms
-)
-{
-    target = clamp_pose(target);
-
-    for (int i = 1; i <= steps; i++)
-    {
-        ArmPose current;
-
-        current.base =
-            interpolate(
-                start.base,
-                target.base,
-                i,
-                steps
-            );
-
-        current.shoulder =
-            interpolate(
-                start.shoulder,
-                target.shoulder,
-                i,
-                steps
-            );
-
-        current.elbow =
-            interpolate(
-                start.elbow,
-                target.elbow,
-                i,
-                steps
-            );
-
-        current.wrist_pitch =
-            interpolate(
-                start.wrist_pitch,
-                target.wrist_pitch,
-                i,
-                steps
-            );
-
-        current.wrist_rotate =
-            interpolate(
-                start.wrist_rotate,
-                target.wrist_rotate,
-                i,
-                steps
-            );
-
-        current.gripper =
-            interpolate(
-                start.gripper,
-                target.gripper,
-                i,
-                steps
-            );
-
-        write_pose(current);
-
-        sleep_ms(delay_ms);
-    }
-}
-
-
-// ============================================================
-// Print pose
-// ============================================================
-
-void print_pose(
-    const char *name,
-    ArmPose pose
-)
-{
-    printf("\n%s\n", name);
-
-    printf(
-        "Base:          %d us\n",
-        pose.base
-    );
-
-    printf(
-        "Shoulder:      %d us\n",
-        pose.shoulder
-    );
-
-    printf(
-        "Elbow:         %d us\n",
-        pose.elbow
-    );
-
-    printf(
-        "Wrist pitch:   %d us\n",
-        pose.wrist_pitch
-    );
-
-    printf(
-        "Wrist rotate:  %d us\n",
-        pose.wrist_rotate
-    );
-
-    printf(
-        "Gripper:       %d us\n",
-        pose.gripper
-    );
-}
-
-
-// ============================================================
-// MAIN
-// ============================================================
-
-int main(void)
-{
-    stdio_init_all();
-
-    sleep_ms(2000);
-
-    printf("\n");
-    printf("===============================\n");
-    printf(" Coordinated Arm Movement Test\n");
-    printf("===============================\n");
-
-    // --------------------------------------------------------
-    // I2C initialization
-    // --------------------------------------------------------
-
-    i2c_init(
-        I2C_PORT,
-        100000
-    );
-
-    gpio_set_function(
-        SDA_PIN,
-        GPIO_FUNC_I2C
-    );
-
-    gpio_set_function(
-        SCL_PIN,
-        GPIO_FUNC_I2C
-    );
-
-    gpio_pull_up(SDA_PIN);
-    gpio_pull_up(SCL_PIN);
-
-
-    // --------------------------------------------------------
-    // PCA9685 initialization
-    // --------------------------------------------------------
-
-    pca_init();
-
-    printf("PCA9685 initialized.\n");
-
-
-    // --------------------------------------------------------
-    // Display configured poses
-    // --------------------------------------------------------
-
-    print_pose(
-        "HOME POSE",
-        HOME
-    );
-
-    print_pose(
-        "SCAN POSE",
-        SCAN_POSE
-    );
-
-
-    // --------------------------------------------------------
-    // IMPORTANT:
-    //
-    // Before powering movement, physically position the arm
-    // reasonably close to HOME if possible.
-    //
-    // With normal hobby servos there is no encoder feedback
-    // to tell us the actual starting angle.
-    // --------------------------------------------------------
-
-    printf("\nMoving to HOME...\n");
-
-    write_pose(HOME);
-
-    sleep_ms(3000);
-
-
-    // --------------------------------------------------------
-    // Coordinated movement loop
-    // --------------------------------------------------------
-
-    while (true)
-    {
-        printf("\nHOME -> TEST\n");
-
-        move_arm_smooth(
-            HOME,
-            SCAN_POSE,
-
-            // number of interpolation steps
-            100,
-
-            // 20 ms per step
-            20
-        );
-
-        sleep_ms(2000);
-
-
-        printf("TEST -> HOME\n");
-
-        move_arm_smooth(
-            SCAN_POSE,
-            HOME,
-            100,
-            20
-        );
-
-        sleep_ms(3000);
-    }
+    /* Returning from usermain shuts the kernel down. */
+    tk_slp_tsk(TMO_FEVR);
+    return 0;
 }

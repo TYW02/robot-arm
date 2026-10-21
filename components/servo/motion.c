@@ -1,640 +1,547 @@
-#include <stdio.h>
-#include <stdint.h>
+#include <tk/tkernel.h>
+#include <tk/device.h>
+#include <tm/tmonitor.h>
 
-#include "pico/stdlib.h"
-#include "hardware/i2c.h"
+#include "robot_arm.h"
 
-// ============================================================
-// I2C / PCA9685
-// ============================================================
+#define PCA9685_ADDRESS       0x40
+#define PCA9685_MODE1         0x00
+#define PCA9685_MODE2         0x01
+#define PCA9685_LED0_ON_L     0x06
+#define PCA9685_PRESCALE      0xFE
 
-#define I2C_PORT       i2c1
-#define SDA_PIN        2
-#define SCL_PIN        3
+/* Physical wiring and calibrated limits are private to Motion Control. */
+#define BASE_CHANNEL             0
+#define SHOULDER_CHANNEL         1
+#define ELBOW_CHANNEL            4
+#define GRIPPER_CHANNEL         11
+#define WRIST_ROTATE_CHANNEL    13
+#define WRIST_PITCH_CHANNEL     15
 
-#define PCA9685_ADDR   0x40
+#define BASE_MIN_US            400
+#define BASE_MAX_US           2900
+#define SHOULDER_MIN_US       1300
+#define SHOULDER_MAX_US       2450
+#define ELBOW_MIN_US          1100
+#define ELBOW_MAX_US          2500
+#define WRIST_PITCH_MIN_US     500
+#define WRIST_PITCH_MAX_US    1850
+#define WRIST_ROTATE_FIXED_US  400
+#define GRIPPER_MIN_US        1450
+#define GRIPPER_MAX_US        2700
+#define GRIPPER_OPEN_US       1450
+#define GRIPPER_CLOSE_US      GRIPPER_MAX_US
 
-#define MODE1          0x00
-#define MODE2          0x01
-#define LED0_ON_L      0x06
-#define PRESCALE       0xFE
+/* Preserve the current working 30 x 15 ms interpolation per stage. */
+#define MOTION_STEPS            30
+#define MOTION_UPDATE_MS         15
+#define STAGE_PAUSE_MS          300
 
+#define TRANSIT_SHOULDER_US    2000
+#define TRANSIT_ELBOW_US       1800
+#define TRANSIT_WRIST_US        700
 
-// ============================================================
-// PCA9685 CHANNELS
-// ============================================================
+/* Tested HOME correction when approaching from ITEM_SCAN. */
+#define HOME_BASE_FROM_ITEM_US 1550
 
-#define BASE_CH          0
-#define SHOULDER_CH      1
-#define ELBOW_CH         2
-
-#define GRIPPER_CH      13
-#define WRIST_ROTATE_CH 14
-#define WRIST_PITCH_CH  15
-
-
-// ============================================================
-// SAFE LIMITS
-// ============================================================
-
-#define BASE_MIN_US          500
-#define BASE_MAX_US         2600
-
-#define SHOULDER_MIN_US     1300
-#define SHOULDER_MAX_US     2450
-
-#define ELBOW_MIN_US        1100
-#define ELBOW_MAX_US        2500
-
-#define WRIST_PITCH_MIN_US   500
-#define WRIST_PITCH_MAX_US  1850
-
-#define WRIST_ROTATE_US      400
-#define GRIPPER_OPEN_US     1450
-
-
-// ============================================================
-// MOVEMENT SETTINGS
-// ============================================================
-
-// 40 x 20 ms = approximately 0.8 s per movement stage
-#define MOTION_STEPS       40
-#define MOTION_DELAY_MS    20
-
-#define STAGE_PAUSE_MS    300
-#define POSE_HOLD_MS     3000
-
-
-// ============================================================
-// ARM POSE
-// ============================================================
-
-typedef struct
-{
-    int base;
-    int shoulder;
-    int elbow;
-    int wrist_pitch;
-    int wrist_rotate;
-    int gripper;
-
-} ArmPose;
-
-
-// ============================================================
-// DEFINED POSITIONS
-// ============================================================
-
-// 1. HOME
 const ArmPose HOME = {
-    .base         = 1450,
-    .shoulder     = 2000,
-    .elbow        = 1800,
-    .wrist_pitch  = 700,
-    .wrist_rotate = 400,
-    .gripper      = 1450
+    .base = 1600,
+    .shoulder = 2000,
+    .elbow = 1800,
+    .wrist_pitch = 700,
+    .wrist_rotate = WRIST_ROTATE_FIXED_US,
+    .gripper = GRIPPER_OPEN_US,
 };
 
-
-// 2. SHELF SCAN
-const ArmPose SCAN_SHELF = {
-    .base         = 550,
-    .shoulder     = 1850,
-    .elbow        = 1900,
-    .wrist_pitch  = 1600,
-    .wrist_rotate = 400,
-    .gripper      = 1450
+const ArmPose SHELF_SCAN = {
+    .base = 400,
+    .shoulder = 1850,
+    .elbow = 1900,
+    .wrist_pitch = 1600,
+    .wrist_rotate = WRIST_ROTATE_FIXED_US,
+    .gripper = GRIPPER_OPEN_US,
 };
 
-
-// 3. ITEM SCAN
-
-const ArmPose SCAN_ITEMS = {
-    .base         = 2900,
-    .shoulder     = 1700,
-    .elbow        = 1500,
-    .wrist_pitch  = 800,
-    .wrist_rotate = 400,
-    .gripper      = 1450
+const ArmPose ITEMS_SCAN = {
+    /* Revalidated by individual-motor testing. */
+    .base = 2900,
+    .shoulder = 1700,
+    .elbow = 1500,
+    .wrist_pitch = 800,
+    .wrist_rotate = WRIST_ROTATE_FIXED_US,
+    .gripper = GRIPPER_OPEN_US,
 };
 
+static ID i2c_device_id;
+static ID i2c_mutex_id;
+static ID command_mbf_id;
+static ID report_mbf_id;
+static ID api_mutex_id;
+static ID worker_task_id;
+static UW next_sequence;
+static BOOL ipc_fault;
+static ArmPose commanded_pose;
+static BOOL pose_initialized;
+static BOOL motion_fault;
+/* Last successfully completed named pose; not measured joint feedback. */
+static INT last_pose_id = -1;
 
-// ============================================================
-// TRANSIT POSTURE
-//
-// Shoulder/elbow are returned here BEFORE large base rotation.
-// Base is not included because it changes depending on destination.
-// ============================================================
-
-#define TRANSIT_SHOULDER_US   2000
-#define TRANSIT_ELBOW_US      1800
-#define TRANSIT_WRIST_US       700
-
-
-// ============================================================
-// CURRENT POSE
-// ============================================================
-
-ArmPose current_pose;
-
-
-// ============================================================
-// PCA9685 WRITE
-// ============================================================
-
-static void pca_write(uint8_t reg, uint8_t value)
+static BOOL pose_valid(const ArmPose *pose)
 {
-    uint8_t data[2] = {
+    return pose != NULL
+        && pose->base >= BASE_MIN_US && pose->base <= BASE_MAX_US
+        && pose->shoulder >= SHOULDER_MIN_US && pose->shoulder <= SHOULDER_MAX_US
+        && pose->elbow >= ELBOW_MIN_US && pose->elbow <= ELBOW_MAX_US
+        && pose->wrist_pitch >= WRIST_PITCH_MIN_US
+        && pose->wrist_pitch <= WRIST_PITCH_MAX_US
+        && pose->wrist_rotate == WRIST_ROTATE_FIXED_US
+        && pose->gripper >= GRIPPER_MIN_US && pose->gripper <= GRIPPER_MAX_US;
+}
+
+/*
+ * This is the only PCA9685 bus-write path. The shared mutex is held only
+ * while tk_swri_dev performs the I2C transaction. It is always released
+ * before any trajectory or settling delay, allowing a future IMU task to use
+ * the bus between servo updates.
+ */
+static ER pca_write_bytes(const UB *bytes, SZ size)
+{
+    SZ actual_size = 0;
+    ER result;
+
+    result = tk_loc_mtx(i2c_mutex_id, TMO_FEVR);
+    if (result < E_OK) return result;
+
+    result = tk_swri_dev(
+        i2c_device_id,
+        PCA9685_ADDRESS,
+        bytes,
+        size,
+        &actual_size
+    );
+
+    {
+        ER unlock_result = tk_unl_mtx(i2c_mutex_id);
+        if (result >= E_OK && unlock_result < E_OK) result = unlock_result;
+    }
+
+    if (result >= E_OK && actual_size != size) return E_IO;
+    return result;
+}
+
+static ER pca_write_register(UB reg, UB value)
+{
+    const UB data[2] = {reg, value};
+    return pca_write_bytes(data, sizeof(data));
+}
+
+static ER pca_init(void)
+{
+    ER result;
+
+    result = pca_write_register(PCA9685_MODE1, 0x10);
+    if (result < E_OK) return result;
+    result = pca_write_register(PCA9685_PRESCALE, 121);
+    if (result < E_OK) return result;
+    result = pca_write_register(PCA9685_MODE2, 0x04);
+    if (result < E_OK) return result;
+    result = pca_write_register(PCA9685_MODE1, 0x20);
+    if (result < E_OK) return result;
+
+    return tk_dly_tsk(10);
+}
+
+static ER servo_set_us(UB channel, UH pulse_us)
+{
+    UH count = (UH)(((UW)pulse_us * 4096U) / 20000U);
+    UB reg = (UB)(PCA9685_LED0_ON_L + (4U * channel));
+    const UB data[5] = {
         reg,
-        value
+        0x00,
+        0x00,
+        (UB)(count & 0xffU),
+        (UB)((count >> 8) & 0x0fU),
     };
-
-    i2c_write_blocking(
-        I2C_PORT,
-        PCA9685_ADDR,
-        data,
-        2,
-        false
-    );
+    return pca_write_bytes(data, sizeof(data));
 }
 
-
-// ============================================================
-// PCA9685 INITIALIZATION
-// ============================================================
-
-static void pca_init(void)
+static ER move_servo_smooth(
+    UB channel, uint16_t *commanded_us, uint16_t target_us, INT steps
+)
 {
-    // Sleep
-    pca_write(MODE1, 0x10);
+    INT start_us = *commanded_us;
+    INT step;
 
-    // Approx. 50 Hz
-    pca_write(PRESCALE, 121);
-
-    // Totem-pole outputs
-    pca_write(MODE2, 0x04);
-
-    // Wake + auto increment
-    pca_write(MODE1, 0x20);
-
-    sleep_ms(10);
-}
-
-
-// ============================================================
-// RAW SERVO OUTPUT
-// ============================================================
-
-static void servo_set_us(uint8_t channel, uint16_t pulse_us)
-{
-    uint16_t count =
-        ((uint32_t)pulse_us * 4096) / 20000;
-
-    uint8_t reg =
-        LED0_ON_L + (4 * channel);
-
-    uint8_t data[5];
-
-    data[0] = reg;
-
-    // ON = 0
-    data[1] = 0x00;
-    data[2] = 0x00;
-
-    // OFF = count
-    data[3] = count & 0xFF;
-    data[4] = (count >> 8) & 0x0F;
-
-    i2c_write_blocking(
-        I2C_PORT,
-        PCA9685_ADDR,
-        data,
-        5,
-        false
-    );
-}
-
-
-// ============================================================
-// CLAMP
-// ============================================================
-
-static int clamp_value(
-    int value,
-    int min_value,
-    int max_value)
-{
-    if (value < min_value)
-        return min_value;
-
-    if (value > max_value)
-        return max_value;
-
-    return value;
-}
-
-
-// ============================================================
-// SMOOTH SINGLE-SERVO MOVEMENT
-// ============================================================
-
-static void move_servo_smooth(
-    uint8_t channel,
-    int start_us,
-    int target_us,
-    int steps,
-    int delay_ms)
-{
-    for (int i = 1; i <= steps; i++)
-    {
-        int pulse =
-            start_us +
-            ((target_us - start_us) * i) / steps;
-
-        servo_set_us(channel, pulse);
-
-        sleep_ms(delay_ms);
+    for (step = 1; step <= steps; ++step) {
+        INT pulse = start_us + ((target_us - start_us) * step) / steps;
+        ER result = servo_set_us(channel, (UH)pulse);
+        if (result < E_OK) return result;
+        *commanded_us = (uint16_t)pulse;
+        result = tk_dly_tsk(MOTION_UPDATE_MS);
+        if (result < E_OK) return result;
     }
+    return E_OK;
 }
 
-
-// ============================================================
-// SHOULDER + ELBOW TOGETHER
-// ============================================================
-
-static void move_shoulder_elbow(
-    int shoulder_start,
-    int shoulder_target,
-    int elbow_start,
-    int elbow_target)
+static ER move_shoulder_elbow(uint16_t shoulder_target, uint16_t elbow_target)
 {
-    shoulder_target =
-        clamp_value(
-            shoulder_target,
-            SHOULDER_MIN_US,
-            SHOULDER_MAX_US
-        );
+    INT shoulder_start = commanded_pose.shoulder;
+    INT elbow_start = commanded_pose.elbow;
+    INT step;
 
-    elbow_target =
-        clamp_value(
-            elbow_target,
-            ELBOW_MIN_US,
-            ELBOW_MAX_US
-        );
+    for (step = 1; step <= MOTION_STEPS; ++step) {
+        INT shoulder = shoulder_start
+            + ((shoulder_target - shoulder_start) * step) / MOTION_STEPS;
+        INT elbow = elbow_start
+            + ((elbow_target - elbow_start) * step) / MOTION_STEPS;
+        ER result;
 
-    for (int i = 1; i <= MOTION_STEPS; i++)
-    {
-        int shoulder =
-            shoulder_start +
-            ((shoulder_target - shoulder_start) * i)
-            / MOTION_STEPS;
-
-        int elbow =
-            elbow_start +
-            ((elbow_target - elbow_start) * i)
-            / MOTION_STEPS;
-
-        servo_set_us(
-            SHOULDER_CH,
-            shoulder
-        );
-
-        servo_set_us(
-            ELBOW_CH,
-            elbow
-        );
-
-        sleep_ms(MOTION_DELAY_MS);
+        result = servo_set_us(SHOULDER_CHANNEL, (UH)shoulder);
+        if (result < E_OK) return result;
+        commanded_pose.shoulder = (uint16_t)shoulder;
+        result = servo_set_us(ELBOW_CHANNEL, (UH)elbow);
+        if (result < E_OK) return result;
+        commanded_pose.elbow = (uint16_t)elbow;
+        result = tk_dly_tsk(MOTION_UPDATE_MS);
+        if (result < E_OK) return result;
     }
+    return E_OK;
 }
 
-
-// ============================================================
-// SET A POSE IMMEDIATELY
-//
-// Only use this for initial HOME setup.
-// ============================================================
-
-static void set_pose_direct(ArmPose pose)
+static ER initialize_home(void)
 {
-    servo_set_us(
-        BASE_CH,
-        pose.base
-    );
+    ER result;
 
-    servo_set_us(
-        SHOULDER_CH,
-        pose.shoulder
-    );
+    pose_initialized = FALSE;
+    /* Deliberately staged: no six-joint simultaneous startup command. */
+    result = servo_set_us(WRIST_ROTATE_CHANNEL, WRIST_ROTATE_FIXED_US);
+    if (result < E_OK) return result;
+    commanded_pose.wrist_rotate = WRIST_ROTATE_FIXED_US;
+    result = servo_set_us(GRIPPER_CHANNEL, GRIPPER_OPEN_US);
+    if (result < E_OK) return result;
+    commanded_pose.gripper = GRIPPER_OPEN_US;
+    result = tk_dly_tsk(STAGE_PAUSE_MS);
+    if (result < E_OK) return result;
 
-    servo_set_us(
-        ELBOW_CH,
-        pose.elbow
-    );
+    result = servo_set_us(WRIST_PITCH_CHANNEL, HOME.wrist_pitch);
+    if (result < E_OK) return result;
+    commanded_pose.wrist_pitch = HOME.wrist_pitch;
+    result = tk_dly_tsk(STAGE_PAUSE_MS);
+    if (result < E_OK) return result;
 
-    servo_set_us(
-        WRIST_PITCH_CH,
-        pose.wrist_pitch
-    );
+    result = servo_set_us(SHOULDER_CHANNEL, HOME.shoulder);
+    if (result < E_OK) return result;
+    commanded_pose.shoulder = HOME.shoulder;
+    result = servo_set_us(ELBOW_CHANNEL, HOME.elbow);
+    if (result < E_OK) return result;
+    commanded_pose.elbow = HOME.elbow;
+    result = tk_dly_tsk(STAGE_PAUSE_MS);
+    if (result < E_OK) return result;
 
-    servo_set_us(
-        WRIST_ROTATE_CH,
-        WRIST_ROTATE_US
-    );
+    result = servo_set_us(BASE_CHANNEL, HOME.base);
+    if (result < E_OK) return result;
+    commanded_pose.base = HOME.base;
+    result = tk_dly_tsk(STAGE_PAUSE_MS);
+    if (result < E_OK) return result;
 
-    servo_set_us(
-        GRIPPER_CH,
-        GRIPPER_OPEN_US
-    );
-
-    current_pose = pose;
+    pose_initialized = TRUE;
+    motion_fault = FALSE;
+    last_pose_id = ARM_POSE_HOME;
+    return E_OK;
 }
 
-
-// ============================================================
-// MOVE TO ANY NAMED POSE
-//
-// Staged movement:
-// 1. Wrist -> transit
-// 2. Shoulder/elbow -> transit
-// 3. Rotate base
-// 4. Shoulder/elbow -> target
-// 5. Wrist pitch -> target
-// ============================================================
-
-static void move_to_pose(
-    const char *name,
-    ArmPose target)
+static ER move_gripper(uint16_t target_us)
 {
-    printf("\nMoving to %s\n", name);
+    ER result;
+    if (commanded_pose.gripper == target_us) return E_OK;
+    result = move_servo_smooth(
+        GRIPPER_CHANNEL, &commanded_pose.gripper, target_us, MOTION_STEPS
+    );
+    if (result < E_OK) return result;
+    return tk_dly_tsk(STAGE_PAUSE_MS);
+}
 
+/* Same five arm stages as the tested implementation; gripper is last. */
+static ER move_to_pose(ArmPose target)
+{
+    ER result;
 
-    // --------------------------------------------------------
-    // Stage 1 - bring wrist to safer transit angle
-    // --------------------------------------------------------
-
-    printf("  Stage 1: Wrist -> transit\n");
-
-    move_servo_smooth(
-        WRIST_PITCH_CH,
-        current_pose.wrist_pitch,
+    result = move_servo_smooth(
+        WRIST_PITCH_CHANNEL,
+        &commanded_pose.wrist_pitch,
         TRANSIT_WRIST_US,
-        MOTION_STEPS,
-        MOTION_DELAY_MS
+        MOTION_STEPS
     );
+    if (result < E_OK) return result;
+    result = tk_dly_tsk(STAGE_PAUSE_MS);
+    if (result < E_OK) return result;
 
-    current_pose.wrist_pitch =
-        TRANSIT_WRIST_US;
-
-    sleep_ms(STAGE_PAUSE_MS);
-
-
-    // --------------------------------------------------------
-    // Stage 2 - retract shoulder + elbow
-    // --------------------------------------------------------
-
-    printf("  Stage 2: Shoulder + Elbow -> transit\n");
-
-    move_shoulder_elbow(
-        current_pose.shoulder,
+    result = move_shoulder_elbow(
         TRANSIT_SHOULDER_US,
-
-        current_pose.elbow,
         TRANSIT_ELBOW_US
     );
+    if (result < E_OK) return result;
+    result = tk_dly_tsk(STAGE_PAUSE_MS);
+    if (result < E_OK) return result;
 
-    current_pose.shoulder =
-        TRANSIT_SHOULDER_US;
-
-    current_pose.elbow =
-        TRANSIT_ELBOW_US;
-
-    sleep_ms(STAGE_PAUSE_MS);
-
-
-    // --------------------------------------------------------
-    // Stage 3 - rotate base
-    // --------------------------------------------------------
-
-    printf("  Stage 3: Base rotation\n");
-
-    target.base =
-        clamp_value(
-            target.base,
-            BASE_MIN_US,
-            BASE_MAX_US
-        );
-
-    move_servo_smooth(
-        BASE_CH,
-        current_pose.base,
+    result = move_servo_smooth(
+        BASE_CHANNEL,
+        &commanded_pose.base,
         target.base,
-        MOTION_STEPS,
-        MOTION_DELAY_MS
+        MOTION_STEPS
     );
+    if (result < E_OK) return result;
+    result = tk_dly_tsk(STAGE_PAUSE_MS);
+    if (result < E_OK) return result;
 
-    current_pose.base =
-        target.base;
-
-    sleep_ms(STAGE_PAUSE_MS);
-
-
-    // --------------------------------------------------------
-    // Stage 4 - shoulder + elbow to target
-    // --------------------------------------------------------
-
-    printf("  Stage 4: Shoulder + Elbow -> target\n");
-
-    move_shoulder_elbow(
-        current_pose.shoulder,
+    result = move_shoulder_elbow(
         target.shoulder,
-
-        current_pose.elbow,
         target.elbow
     );
+    if (result < E_OK) return result;
+    result = tk_dly_tsk(STAGE_PAUSE_MS);
+    if (result < E_OK) return result;
 
-    current_pose.shoulder =
-        target.shoulder;
-
-    current_pose.elbow =
-        target.elbow;
-
-    sleep_ms(STAGE_PAUSE_MS);
-
-
-    // --------------------------------------------------------
-    // Stage 5 - wrist pitch to target
-    // --------------------------------------------------------
-
-    printf("  Stage 5: Wrist -> target\n");
-
-    target.wrist_pitch =
-        clamp_value(
-            target.wrist_pitch,
-            WRIST_PITCH_MIN_US,
-            WRIST_PITCH_MAX_US
-        );
-
-    move_servo_smooth(
-        WRIST_PITCH_CH,
-        current_pose.wrist_pitch,
+    result = move_servo_smooth(
+        WRIST_PITCH_CHANNEL,
+        &commanded_pose.wrist_pitch,
         target.wrist_pitch,
-        MOTION_STEPS,
-        MOTION_DELAY_MS
+        MOTION_STEPS
     );
+    if (result < E_OK) return result;
+    result = servo_set_us(WRIST_ROTATE_CHANNEL, target.wrist_rotate);
+    if (result < E_OK) return result;
+    commanded_pose.wrist_rotate = target.wrist_rotate;
 
-    current_pose.wrist_pitch =
-        target.wrist_pitch;
-
-
-    // --------------------------------------------------------
-    // Wrist rotate + gripper remain fixed
-    // --------------------------------------------------------
-
-    servo_set_us(
-        WRIST_ROTATE_CH,
-        WRIST_ROTATE_US
-    );
-
-    servo_set_us(
-        GRIPPER_CH,
-        GRIPPER_OPEN_US
-    );
-
-    current_pose.wrist_rotate =
-        WRIST_ROTATE_US;
-
-    current_pose.gripper =
-        GRIPPER_OPEN_US;
-
-
-    printf("%s reached\n", name);
+    /* Completion includes final settling, independently of coordinator holds. */
+    result = tk_dly_tsk(STAGE_PAUSE_MS);
+    if (result < E_OK) return result;
+    return move_gripper(target.gripper);
 }
 
-
-// ============================================================
-// MAIN
-// ============================================================
-
-int main(void)
+static const ArmPose *pose_from_id(ArmPoseId pose)
 {
-    stdio_init_all();
+    switch (pose) {
+    case ARM_POSE_HOME:
+        return &HOME;
+    case ARM_POSE_SHELF_SCAN:
+        return &SHELF_SCAN;
+    case ARM_POSE_ITEM_SCAN:
+        return &ITEMS_SCAN;
+    default:
+        return NULL;
+    }
+}
 
-    sleep_ms(2000);
+/* Gripper state is independent of the last completed named arm pose. */
+static BOOL same_arm_joints(const ArmPose *a, const ArmPose *b)
+{
+    return a->base == b->base && a->shoulder == b->shoulder
+        && a->elbow == b->elbow && a->wrist_pitch == b->wrist_pitch
+        && a->wrist_rotate == b->wrist_rotate;
+}
 
-    printf("\n");
-    printf("====================================\n");
-    printf(" Robot Arm Scan Sequence Test\n");
-    printf("====================================\n");
+static MotionResult execute_movj(const ArmPose *target)
+{
+    ER result;
+    if (!pose_valid(target)) return MOTION_INVALID_POSE;
+    if (!pose_initialized) return MOTION_NOT_READY;
+    if (motion_fault) return MOTION_IO_ERROR;
 
+    result = move_to_pose(*target);
+    if (result < E_OK) {
+        motion_fault = TRUE;
+        last_pose_id = -1;
+        return MOTION_IO_ERROR;
+    }
 
-    // --------------------------------------------------------
-    // I2C initialization
-    // --------------------------------------------------------
+    if (same_arm_joints(target, &ITEMS_SCAN)) last_pose_id = ARM_POSE_ITEM_SCAN;
+    else if (same_arm_joints(target, &SHELF_SCAN)) last_pose_id = ARM_POSE_SHELF_SCAN;
+    else if (same_arm_joints(target, &HOME)) last_pose_id = ARM_POSE_HOME;
+    else last_pose_id = -1;
+    return MOTION_OK;
+}
 
-    i2c_init(
-        I2C_PORT,
-        100000
-    );
+static MotionResult execute_command(const MotionCommand *command)
+{
+    const ArmPose *target;
+    ArmPose adjusted_target;
+    ER result;
 
-    gpio_set_function(
-        SDA_PIN,
-        GPIO_FUNC_I2C
-    );
+    switch (command->type) {
+    case MOTION_COMMAND_INITIALIZE_HOME:
+        result = initialize_home();
+        if (result < E_OK) {
+            motion_fault = TRUE;
+            return MOTION_IO_ERROR;
+        }
+        return MOTION_OK;
+    case MOTION_COMMAND_MOVJ:
+        return execute_movj(&command->target);
+    case MOTION_COMMAND_MOVE_POSE:
+        target = pose_from_id(command->pose);
+        if (target == NULL) return MOTION_INVALID_POSE;
+        if (!pose_initialized) return MOTION_NOT_READY;
 
-    gpio_set_function(
-        SCL_PIN,
-        GPIO_FUNC_I2C
-    );
+        adjusted_target = *target;
+        adjusted_target.gripper = commanded_pose.gripper;
+        if (command->pose == ARM_POSE_HOME) {
+            if (last_pose_id == ARM_POSE_ITEM_SCAN) {
+                adjusted_target.base = HOME_BASE_FROM_ITEM_US;
+            } else if (last_pose_id == ARM_POSE_HOME) {
+                /* Repeating HOME must retain the last HOME correction. */
+                adjusted_target.base = commanded_pose.base;
+            }
+        }
 
-    gpio_pull_up(SDA_PIN);
-    gpio_pull_up(SCL_PIN);
+        {
+            MotionResult status = execute_movj(&adjusted_target);
+            if (status == MOTION_OK) last_pose_id = command->pose;
+            return status;
+        }
+    case MOTION_COMMAND_SET_GRIPPER:
+        if (command->gripper_us < GRIPPER_MIN_US
+            || command->gripper_us > GRIPPER_MAX_US) return MOTION_INVALID_POSE;
+        if (!pose_initialized) return MOTION_NOT_READY;
+        if (motion_fault) return MOTION_IO_ERROR;
+        result = move_gripper((uint16_t)command->gripper_us);
+        if (result < E_OK) {
+            motion_fault = TRUE;
+            return MOTION_IO_ERROR;
+        }
+        return MOTION_OK;
+    default:
+        return MOTION_INVALID_POSE;
+    }
+}
 
+/* The existing command/report exchange, now hidden behind the public API. */
+static MotionResult submit_command(MotionCommand *command)
+{
+    MotionReport report;
+    MotionResult status = MOTION_IPC_ERROR;
+    T_RSYS system_state;
+    ER result;
+    INT size;
 
-    // --------------------------------------------------------
-    // PCA9685 initialization
-    // --------------------------------------------------------
+    result = tk_ref_sys(&system_state);
+    if (result < E_OK
+        || (system_state.sysstat & (TSS_INDP | TSS_DDSP | TSS_DINT)) != 0
+        || system_state.runtskid <= 0
+        || system_state.runtskid == worker_task_id) return MOTION_WRONG_CONTEXT;
+    if (api_mutex_id <= 0 || command_mbf_id <= 0 || report_mbf_id <= 0) {
+        return MOTION_NOT_READY;
+    }
 
-    pca_init();
+    result = tk_loc_mtx(api_mutex_id, TMO_FEVR);
+    if (result < E_OK) return MOTION_IPC_ERROR;
 
-    printf("PCA9685 initialized\n");
+    /* A lost/mismatched reply must not be mistaken for a later completion. */
+    if (ipc_fault) goto done;
+    command->sequence = ++next_sequence;
+    result = tk_snd_mbf(command_mbf_id, command, (INT)sizeof(*command), TMO_FEVR);
+    if (result < E_OK) {
+        ipc_fault = TRUE;
+        goto done;
+    }
 
+    size = tk_rcv_mbf(report_mbf_id, &report, TMO_FEVR);
+    if (size != (INT)sizeof(report) || report.sequence != command->sequence) {
+        ipc_fault = TRUE;
+        goto done;
+    }
+    status = report.result;
 
-    // ========================================================
-    // 1. HOME
-    // ========================================================
+done:
+    if (tk_unl_mtx(api_mutex_id) < E_OK) return MOTION_IPC_ERROR;
+    return status;
+}
 
-    printf("\n1. HOME\n");
+MotionResult MovJ(const ArmPose *target)
+{
+    MotionCommand command = {.type = MOTION_COMMAND_MOVJ};
+    if (target == NULL) return MOTION_INVALID_POSE;
+    command.target = *target;
+    if (!pose_valid(&command.target)) return MOTION_INVALID_POSE;
+    return submit_command(&command);
+}
 
-    set_pose_direct(HOME);
+static MotionResult submit_named_pose(ArmPoseId pose)
+{
+    MotionCommand command = {.type = MOTION_COMMAND_MOVE_POSE, .pose = pose};
+    return submit_command(&command);
+}
 
-    sleep_ms(POSE_HOLD_MS);
+MotionResult MoveHome(void) { return submit_named_pose(ARM_POSE_HOME); }
+MotionResult MoveShelfScan(void) { return submit_named_pose(ARM_POSE_SHELF_SCAN); }
+MotionResult MoveItemsScan(void) { return submit_named_pose(ARM_POSE_ITEM_SCAN); }
 
+static MotionResult submit_gripper(INT pulse_us)
+{
+    MotionCommand command = {
+        .type = MOTION_COMMAND_SET_GRIPPER,
+        .gripper_us = pulse_us,
+    };
+    return submit_command(&command);
+}
 
-    // ========================================================
-    // 2. SCAN SHELF
-    // ========================================================
+MotionResult GripperOpen(void) { return submit_gripper(GRIPPER_OPEN_US); }
+MotionResult GripperClose(void) { return submit_gripper(GRIPPER_CLOSE_US); }
 
-    printf("\n2. SCAN SHELF\n");
+MotionResult motion_initialize_home(void)
+{
+    MotionCommand command = {.type = MOTION_COMMAND_INITIALIZE_HOME};
+    return submit_command(&command);
+}
 
-    move_to_pose(
-        "SCAN SHELF",
-        SCAN_SHELF
-    );
+void motion_configure(
+    ID i2c_device, ID i2c_mutex, ID command_mbf, ID report_mbf,
+    ID api_mutex, ID worker_task
+)
+{
+    i2c_device_id = i2c_device;
+    i2c_mutex_id = i2c_mutex;
+    command_mbf_id = command_mbf;
+    report_mbf_id = report_mbf;
+    api_mutex_id = api_mutex;
+    worker_task_id = worker_task;
+}
 
-    sleep_ms(POSE_HOLD_MS);
+void motion_task(INT start_code, void *extended_info)
+{
+    MotionCommand command;
+    MotionReport report;
+    ER pca_status;
 
+    (void)start_code;
+    (void)extended_info;
 
-    // ========================================================
-    // 3. SCAN ITEMS
-    // ========================================================
+    pca_status = pca_init();
+    if (pca_status < E_OK) {
+        tm_printf((UB *)"[motion] PCA9685 initialization failed: %d\n", pca_status);
+    }
 
-    printf("\n3. SCAN ITEMS\n");
+    while (1) {
+        INT received_size = tk_rcv_mbf(command_mbf_id, &command, TMO_FEVR);
 
-    move_to_pose(
-        "SCAN ITEMS",
-        SCAN_ITEMS
-    );
+        if (received_size != (INT)sizeof(command)) {
+            report.sequence = 0;
+            report.result = MOTION_IPC_ERROR;
+        } else if (pca_status < E_OK) {
+            report.sequence = command.sequence;
+            report.result = MOTION_IO_ERROR;
+        } else {
+            report.sequence = command.sequence;
+            report.result = execute_command(&command);
+        }
 
-    sleep_ms(POSE_HOLD_MS);
-
-
-    // ========================================================
-    // 4. SCAN SHELF AGAIN
-    // ========================================================
-
-    printf("\n4. SCAN SHELF\n");
-
-    move_to_pose(
-        "SCAN SHELF",
-        SCAN_SHELF
-    );
-
-    sleep_ms(POSE_HOLD_MS);
-
-
-    // ========================================================
-    // 5. HOME
-    // ========================================================
-
-    printf("\n5. HOME\n");
-
-    move_to_pose(
-        "HOME",
-        HOME
-    );
-
-    sleep_ms(POSE_HOLD_MS);
-
-
-    // ========================================================
-    // FINISHED
-    // ========================================================
-
-    printf("\nSequence complete.\n");
-
-    while (true)
-    {
-        tight_loop_contents();
+        if (tk_snd_mbf(
+                report_mbf_id,
+                &report,
+                (INT)sizeof(report),
+                TMO_FEVR
+            ) < E_OK) {
+            tm_printf((UB *)"[motion] unable to report command completion\n");
+        }
     }
 }

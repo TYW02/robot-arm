@@ -26,10 +26,10 @@
 
 #define BASE_CH 0
 #define SHOULDER_CH 1
-#define ELBOW_CH 2  
+#define ELBOW_CH 4
 #define WRIST_PITCH_CH 15
-#define WRIST_ROTATE_CH 14
-#define GRIPPER_CH 13
+#define WRIST_ROTATE_CH 13
+#define GRIPPER_CH 11
 
 
 // ============================================================
@@ -152,13 +152,9 @@ int main(void)
 
     while (true)
     {
-        servo_set_us(BASE_CH,550);
+        servo_set_us(BASE_CH,400);
         sleep_ms(2000);
-        servo_set_us(WRIST_PITCH_CH, 1600);
-        sleep_ms(2000);
-        servo_set_us(ELBOW_CH, 1900);
-        sleep_ms(2000);
-        servo_set_us(SHOULDER_CH, 1900);
+        servo_set_us(BASE_CH,1550);
         sleep_ms(2000);
     }
 }
