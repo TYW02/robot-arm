@@ -1,11 +1,12 @@
 #include <stddef.h>
 
+/* Prevent µT-Kernel from redefining size_t. */
 #define PROHIBIT_DEF_SIZE_T
 
 #include "imu_service.h"
+
 #include <math.h>
 #include <string.h>
-
 
 #if TK_SUPPORT_SMP
 #include <tk/smp.h>
@@ -14,531 +15,470 @@
 #define IMU_CPU() 1
 #endif
 
-#define IMU_PERIOD_MS       20U
-#define IMU_VERIFY_MS       1000U
-#define IMU_TOLERANCE_DEG   5.0f
-#define IMU_TASK_STACK      4096
-
-/*
- * Verification timeout is currently
- * a proposed value, not a Week 6 NFR.
- */
+#define IMU_PERIOD_MS   20U
+#define IMU_TASK_STACK  4096
 
 enum {
-    CMD_VERIFY = 1,
-    CMD_CANCEL,
-    CMD_SNAPSHOT,
+    CMD_SET_YAW = 1,
     CMD_REINIT
 };
 
 typedef struct {
     UW type;
     UW request_id;
-
-    float pitch_deg;
-    float roll_deg;
+    float yaw_deg;
 } imu_command_t;
 
-/*
- * Persistent storage for kernel
- * message buffers.
- */
+/* Persistent storage for kernel message buffers. */
 static UW command_store[128];
 static UW result_store[256];
 
 static ID command_mbf = 0;
 static ID result_mbf = 0;
 static ID imu_task_id = 0;
+
 static ID i2c_mutex = 0;
+static ID sample_mutex = 0;
+
+static imu_sample_t latest_sample = {0};
+static UW dropped_events = 0;
 
 /* -------------------------------------
- * Send IMU result
+ * Service events
  * ------------------------------------- */
 
-static ER publish(
+static void publish(
     UW event,
-    UW request,
-    const imu_sample_t *sample
+    UW request_id,
+    ER error
 ) {
     imu_result_t result = {0};
 
     result.event = event;
-    result.request_id = request;
+    result.request_id = request_id;
+    result.error = error;
+    result.dropped_events = dropped_events;
     result.producer_core = IMU_CPU();
 
-    if (sample != NULL) {
-        result.sample = *sample;
-    }
-
     /*
-     * Nonblocking send:
-     * Do not delay sensor sampling.
-     *
-     * Coordinator must treat missing
-     * responses as failed verification.
+     * Never wait for room in the event queue.
+     * The coordinator must time out missing replies.
      */
-    return tk_snd_mbf(
+    ER er = tk_snd_mbf(
         result_mbf,
         &result,
         sizeof(result),
         TMO_POL
     );
+
+    if (er != E_OK) {
+        dropped_events++;
+    }
 }
 
 /* -------------------------------------
- * IMU Task
+ * Latest-sample storage
  * ------------------------------------- */
 
-static void imu_task(
-    INT stacd,
-    void *exinf
-) {
+static ER save_sample(const imu_sample_t *sample) {
+    ER er = tk_loc_mtx(sample_mutex, TMO_FEVR);
+
+    if (er != E_OK) {
+        return er;
+    }
+
+    latest_sample = *sample;
+
+    return tk_unl_mtx(sample_mutex);
+}
+
+static ER clear_sample(void) {
+    imu_sample_t empty = {0};
+
+    empty.status = IMU_STATUS_NOT_READY;
+
+    return save_sample(&empty);
+}
+
+/* -------------------------------------
+ * IMU owner task
+ * ------------------------------------- */
+
+static void imu_task(INT stacd, void *exinf) {
     (void)stacd;
     (void)exinf;
 
-    imu_sample_t sample = {0};
-
-    UW active_request = 0;
-    UW start_ms = 0;
-    UW previous_ms = 0;
-    UW next_ms = 0;
-
-    INT good_count = 0;
-
-    float desired_pitch = 0;
-    float desired_roll = 0;
-
     /*
-     * Initialise and calibrate.
-     * Arm must be stationary.
+     * The coordinator must keep the car stopped
+     * throughout startup calibration.
      */
-    INT online =
-        imu_mtk3_init(i2c_mutex) == E_OK;
+    ER er = imu_mtk3_init(i2c_mutex);
 
+    INT online = er == E_OK;
     INT fault_announced = !online;
 
-    (void)publish(
+    publish(
         online ? IMU_EVT_READY : IMU_EVT_FAULT,
         0,
-        NULL
+        er
     );
 
-    next_ms =
-        imu_mtk3_now_ms() + IMU_PERIOD_MS;
+    /*
+     * Wait one sampling period before the first read.
+     * The driver established its time reference during init.
+     */
+    UW next_ms = imu_mtk3_now_ms() + IMU_PERIOD_MS;
 
     while (1) {
+        UW now = imu_mtk3_now_ms();
 
-        /* -----------------------------
-         * 1. Process commands
-         * ----------------------------- */
-
-        imu_command_t command;
-
-        /*
-         * Process no more than four
-         * commands per sampling cycle.
-         */
-        for (INT i = 0; i < 4; i++) {
-
-            INT n = tk_rcv_mbf(
-                command_mbf,
-                &command,
-                TMO_POL
+        if ((W)(next_ms - now) > 0) {
+            (void)tk_dly_tsk(
+                (RELTIM)(next_ms - now)
             );
-
-            if (n == E_TMOUT) {
-                break;
-            }
-
-            if (n != (INT)sizeof(command)) {
-                active_request = 0;
-                break;
-            }
-
-            /* Cancel verification. */
-            if (command.type == CMD_CANCEL) {
-
-                UW previous_request =
-                    active_request;
-
-                active_request = 0;
-                good_count = 0;
-
-                (void)publish(
-                    IMU_EVT_CANCELLED,
-                    previous_request,
-                    NULL
-                );
-            }
-
-            /* Reinitialise IMU. */
-            else if (
-                command.type == CMD_REINIT
-            ) {
-                active_request = 0;
-                good_count = 0;
-
-                memset(
-                    &sample,
-                    0,
-                    sizeof(sample)
-                );
-
-                /*
-                 * Must be stationary during
-                 * recalibration.
-                 */
-                online =
-                    imu_mtk3_init(i2c_mutex) == E_OK;
-
-                fault_announced = !online;
-
-                (void)publish(
-                    online
-                        ? IMU_EVT_READY
-                        : IMU_EVT_FAULT,
-                    0,
-                    NULL
-                );
-
-                next_ms =
-                    imu_mtk3_now_ms() +
-                    IMU_PERIOD_MS;
-            }
-
-            /* Request latest reading. */
-            else if (
-                command.type == CMD_SNAPSHOT
-            ) {
-                (void)publish(
-                    sample.valid
-                        ? IMU_EVT_SAMPLE
-                        : IMU_EVT_FAULT,
-                    command.request_id,
-                    &sample
-                );
-            }
-
-            /* Start verification. */
-            else if (
-                command.type == CMD_VERIFY
-            ) {
-                active_request = 0;
-                good_count = 0;
-                previous_ms = 0;
-
-                if (!online ||
-                    command.request_id == 0 ||
-                    !isfinite(command.pitch_deg) ||
-                    !isfinite(command.roll_deg)) {
-
-                    (void)publish(
-                        IMU_EVT_FAULT,
-                        command.request_id,
-                        &sample
-                    );
-
-                } else {
-                    active_request =
-                        command.request_id;
-
-                    start_ms =
-                        imu_mtk3_now_ms();
-
-                    desired_pitch =
-                        command.pitch_deg;
-
-                    desired_roll =
-                        command.roll_deg;
-                }
-            }
         }
 
+        next_ms += IMU_PERIOD_MS;
+
         /* -----------------------------
-         * 2. Sample MPU-6500
+         * 1. Sample the gyroscope
          * ----------------------------- */
 
         if (online) {
+            imu_sample_t sample;
 
-            INT updated =
-                imu_mtk3_read(&sample);
+            (void)imu_mtk3_read(&sample);
 
-            UW now = imu_mtk3_now_ms();
+            ER stored = save_sample(&sample);
 
-            if (updated) {
+            INT healthy =
+                stored == E_OK &&
+                sample.rate_valid &&
+                sample.heading_valid;
+
+            if (healthy) {
                 fault_announced = 0;
-            }
-            else if (
-                active_request == 0 &&
-                !fault_announced
-            ) {
-                /*
-                 * Report sensor failure
-                 * even if no verification
-                 * is currently active.
-                 */
-                (void)publish(
+            } else if (!fault_announced) {
+                publish(
                     IMU_EVT_FAULT,
                     0,
-                    &sample
+                    stored != E_OK ? stored : E_IO
                 );
 
                 fault_announced = 1;
             }
-
-            /* -------------------------
-             * 3. Orientation verification
-             * ------------------------- */
-
-            if (active_request != 0) {
-
-                UW request =
-                    active_request;
-
-                /*
-                 * Check timeout first.
-                 * Never approve after timeout.
-                 */
-                if ((UW)(now - start_ms) >=
-                    IMU_VERIFY_MS) {
-
-                    active_request = 0;
-
-                    (void)publish(
-                        IMU_EVT_OUT_OF_TOLERANCE,
-                        request,
-                        &sample
-                    );
-                }
-
-                /*
-                 * Reject invalid, delayed
-                 * or duplicated samples.
-                 */
-                else if (
-                    !updated ||
-                    !sample.valid ||
-                    sample.timestamp_ms < start_ms ||
-                    sample.interval_ms == 0 ||
-                    sample.interval_ms > 50U ||
-                    (UW)(
-                        now - sample.timestamp_ms
-                    ) > 50U ||
-                    (
-                        previous_ms != 0 &&
-                        (
-                            sample.timestamp_ms
-                                <= previous_ms ||
-                            (UW)(
-                                sample.timestamp_ms -
-                                previous_ms
-                            ) > 50U
-                        )
-                    )
-                ) {
-                    active_request = 0;
-
-                    (void)publish(
-                        IMU_EVT_FAULT,
-                        request,
-                        &sample
-                    );
-                }
-
-                else {
-                    previous_ms =
-                        sample.timestamp_ms;
-
-                    float pitch_error =
-                        fabsf(
-                            sample.pitch_deg -
-                            desired_pitch
-                        );
-
-                    float roll_error =
-                        fabsf(
-                            remainderf(
-                                sample.roll_deg -
-                                desired_roll,
-                                360.0f
-                            )
-                        );
-
-                    INT within_tolerance =
-                        pitch_error <=
-                            IMU_TOLERANCE_DEG &&
-                        roll_error <=
-                            IMU_TOLERANCE_DEG &&
-                        sample.stationary;
-
-                    /*
-                     * NFR4:
-                     * Require two consecutive
-                     * valid samples.
-                     */
-                    if (within_tolerance) {
-                        good_count++;
-                    } else {
-                        good_count = 0;
-                    }
-
-                    if (good_count >= 2) {
-
-                        active_request = 0;
-
-                        (void)publish(
-                            IMU_EVT_VERIFIED,
-                            request,
-                            &sample
-                        );
-                    }
-                }
-            }
-        }
-
-        else {
-            /*
-             * After failed initialisation,
-             * no approval is possible.
-             */
-            active_request = 0;
         }
 
         /* -----------------------------
-         * 4. Periodic task scheduling
+         * 2. Process one queued command
          * ----------------------------- */
 
-        UW now = imu_mtk3_now_ms();
+        imu_command_t command;
 
-        if ((W)(next_ms - now) > 0) {
+        INT n = tk_rcv_mbf(
+            command_mbf,
+            &command,
+            TMO_POL
+        );
 
-            (void)tk_dly_tsk(
-                (RELTIM)(next_ms - now)
+        if (n == (INT)sizeof(command)) {
+            if (command.request_id == 0) {
+                publish(IMU_EVT_FAULT, 0, E_PAR);
+            }
+
+            else if (command.type == CMD_REINIT) {
+                /*
+                 * Hide the previous sample before calibration.
+                 * The caller must keep the car stopped.
+                 */
+                er = clear_sample();
+
+                if (er == E_OK) {
+                    er = imu_mtk3_init(i2c_mutex);
+
+                    online = er == E_OK;
+                    fault_announced = !online;
+                }
+
+                publish(
+                    er == E_OK
+                        ? IMU_EVT_READY
+                        : IMU_EVT_FAULT,
+                    command.request_id,
+                    er
+                );
+
+                /*
+                 * Calibration takes time. Establish a new
+                 * schedule instead of catching up old samples.
+                 */
+                next_ms =
+                    imu_mtk3_now_ms() + IMU_PERIOD_MS;
+            }
+
+            else if (command.type == CMD_SET_YAW) {
+                /*
+                 * Process this after a sensor read so the
+                 * driver's low-rate check uses current data.
+                 */
+                er = online
+                    ? imu_mtk3_set_yaw(command.yaw_deg)
+                    : E_OBJ;
+
+                if (er == E_OK) {
+                    /*
+                     * Do not expose the old reference after
+                     * reporting that a new one was established.
+                     */
+                    er = clear_sample();
+                    fault_announced = 0;
+
+                    next_ms =
+                        imu_mtk3_now_ms() + IMU_PERIOD_MS;
+                }
+
+                publish(
+                    er == E_OK
+                        ? IMU_EVT_REFERENCE_SET
+                        : IMU_EVT_FAULT,
+                    command.request_id,
+                    er
+                );
+            }
+
+            else {
+                publish(
+                    IMU_EVT_FAULT,
+                    command.request_id,
+                    E_PAR
+                );
+            }
+        }
+
+        else if (n != E_TMOUT) {
+            publish(
+                IMU_EVT_FAULT,
+                0,
+                n < 0 ? n : E_IO
             );
+        }
 
-            next_ms += IMU_PERIOD_MS;
+        /* -----------------------------
+         * 3. Avoid rapid catch-up reads
+         * ----------------------------- */
 
-        } else {
+        now = imu_mtk3_now_ms();
 
-            next_ms =
-                now + IMU_PERIOD_MS;
-
-            (void)tk_dly_tsk(1);
+        if ((W)(now - next_ms) >= 0) {
+            next_ms = now + IMU_PERIOD_MS;
         }
     }
 }
 
 /* -------------------------------------
- * Start IMU subsystem
+ * Start the service
  * ------------------------------------- */
 
-ER imu_service_start(
-    ID shared_i2c_mutex
-) {
-    if (shared_i2c_mutex <= 0 ||
-        imu_task_id > 0) {
+ER imu_service_start(ID shared_i2c_mutex) {
+    if (shared_i2c_mutex <= 0 || imu_task_id > 0) {
         return E_PAR;
     }
 
     i2c_mutex = shared_i2c_mutex;
+    dropped_events = 0;
 
-    /* Coordinator -> IMU buffer */
+    memset(&latest_sample, 0, sizeof(latest_sample));
+    latest_sample.status = IMU_STATUS_NOT_READY;
+
+    /*
+     * This mutex protects only the latest-sample copy.
+     * It is separate from the shared I2C mutex.
+     */
+    T_CMTX mutex = {0};
+
+    mutex.mtxatr = TA_TFIFO | TA_INHERIT;
+
+    sample_mutex = tk_cre_mtx(&mutex);
+
+    if (sample_mutex <= 0) {
+        ER error = sample_mutex;
+        sample_mutex = 0;
+        return error;
+    }
+
+    ER er;
+
+    /* Coordinator -> IMU command buffer. */
     T_CMBF commands = {0};
 
     commands.mbfatr = TA_TFIFO;
-    commands.bufsz =
-        sizeof(command_store);
-
-    commands.maxmsz =
-        sizeof(imu_command_t);
-
+    commands.bufsz = sizeof(command_store);
+    commands.maxmsz = sizeof(imu_command_t);
     commands.bufptr = command_store;
 
-    command_mbf =
-        tk_cre_mbf(&commands);
+    command_mbf = tk_cre_mbf(&commands);
 
     if (command_mbf <= 0) {
-        return command_mbf;
+        er = command_mbf;
+        goto cleanup;
     }
 
-    /* IMU -> Coordinator buffer */
+    /* IMU -> coordinator event buffer. */
     T_CMBF results = {0};
 
     results.mbfatr = TA_TFIFO;
-    results.bufsz =
-        sizeof(result_store);
-
-    results.maxmsz =
-        sizeof(imu_result_t);
-
+    results.bufsz = sizeof(result_store);
+    results.maxmsz = sizeof(imu_result_t);
     results.bufptr = result_store;
 
-    result_mbf =
-        tk_cre_mbf(&results);
+    result_mbf = tk_cre_mbf(&results);
 
     if (result_mbf <= 0) {
-        return result_mbf;
+        er = result_mbf;
+        goto cleanup;
     }
 
-    /* Create the IMU Task. */
     T_CTSK task = {0};
 
     task.task = imu_task;
     task.itskpri = 5;
     task.stksz = IMU_TASK_STACK;
+    task.tskatr = TA_HLNG | TA_RNG3;
 
 #if TK_SUPPORT_SMP
-    task.tskatr =
-        TA_HLNG | TA_RNG3 | TA_ASSPRC;
+    task.tskatr |= TA_ASSPRC;
 
-    /*
-     * Processor 1 = RP2040 core 0.
-     * Can be changed during integration.
-     */
+    /* Kernel processor 1 = RP2040 physical core 0. */
     task.assprc = TP_PRC1;
-#else
-    task.tskatr =
-        TA_HLNG | TA_RNG3;
 #endif
 
-    ID id = tk_cre_tsk(&task);
+    imu_task_id = tk_cre_tsk(&task);
 
-    if (id <= 0) {
-        return id;
+    if (imu_task_id <= 0) {
+        er = imu_task_id;
+        imu_task_id = 0;
+        goto cleanup;
     }
 
-    ER er = tk_sta_tsk(id, 0);
+    er = tk_sta_tsk(imu_task_id, 0);
+
+    if (er == E_OK) {
+        return E_OK;
+    }
+
+    (void)tk_del_tsk(imu_task_id);
+    imu_task_id = 0;
+
+cleanup:
+    /*
+     * Release objects created before a startup failure,
+     * allowing the coordinator to try starting again.
+     */
+    if (result_mbf > 0) {
+        (void)tk_del_mbf(result_mbf);
+    }
+
+    if (command_mbf > 0) {
+        (void)tk_del_mbf(command_mbf);
+    }
+
+    if (sample_mutex > 0) {
+        (void)tk_del_mtx(sample_mutex);
+    }
+
+    result_mbf = 0;
+    command_mbf = 0;
+    sample_mutex = 0;
+
+    return er;
+}
+
+/* -------------------------------------
+ * Read the latest sample
+ * ------------------------------------- */
+
+ER imu_service_latest(imu_sample_t *out) {
+    if (out == NULL) {
+        return E_PAR;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->status = IMU_STATUS_NOT_READY;
+
+    if (imu_task_id <= 0 || sample_mutex <= 0) {
+        return E_OBJ;
+    }
+
+    /*
+     * Do not block motion control while obtaining a sample.
+     * Failure leaves the caller with an invalid result.
+     */
+    ER er = tk_loc_mtx(sample_mutex, TMO_POL);
 
     if (er != E_OK) {
-        (void)tk_del_tsk(id);
         return er;
     }
 
-    imu_task_id = id;
+    *out = latest_sample;
 
+    er = tk_unl_mtx(sample_mutex);
+
+    if (er != E_OK) {
+        out->rate_valid = 0;
+        out->heading_valid = 0;
+        out->low_rate = 0;
+        return er;
+    }
+
+    if (!out->rate_valid) {
+        return E_OBJ;
+    }
+
+    SYSTIM time;
+
+    if (tk_get_otm(&time) != E_OK ||
+        (UW)(time.lo - out->timestamp_ms) >
+            IMU_MAX_GAP_MS) {
+
+        out->rate_valid = 0;
+        out->heading_valid = 0;
+        out->low_rate = 0;
+        out->status = IMU_STATUS_TIMING;
+
+        return E_OBJ;
+    }
+
+    /*
+     * A valid rate does not guarantee a valid heading.
+     * The caller must also check out->heading_valid.
+     */
     return E_OK;
 }
 
 /* -------------------------------------
- * Send command to IMU Task
+ * Queue coordinator commands
  * ------------------------------------- */
 
 static ER send_command(
     UW type,
-    UW request,
-    float pitch,
-    float roll
+    UW request_id,
+    float yaw_deg
 ) {
-    imu_command_t command = {
-        type,
-        request,
-        pitch,
-        roll
-    };
+    if (request_id == 0 ||
+        !isfinite(yaw_deg) ||
+        fabsf(yaw_deg) > 1000000.0f) {
+        return E_PAR;
+    }
 
-    if (command_mbf <= 0) {
+    if (imu_task_id <= 0 || command_mbf <= 0) {
         return E_OBJ;
     }
+
+    imu_command_t command = {
+        .type = type,
+        .request_id = request_id,
+        .yaw_deg = yaw_deg
+    };
 
     return tk_snd_mbf(
         command_mbf,
@@ -548,63 +488,31 @@ static ER send_command(
     );
 }
 
-/* -------------------------------------
- * Public Coordinator interfaces
- * ------------------------------------- */
-
-ER imu_service_verify(
+ER imu_service_set_yaw(
     UW request_id,
-    float pitch,
-    float roll
-) {
-    if (request_id == 0 ||
-        !isfinite(pitch) ||
-        !isfinite(roll)) {
-        return E_PAR;
-    }
-
-    return send_command(
-        CMD_VERIFY,
-        request_id,
-        pitch,
-        roll
-    );
-}
-
-ER imu_service_snapshot(
-    UW request_id
+    float yaw_deg
 ) {
     return send_command(
-        CMD_SNAPSHOT,
+        CMD_SET_YAW,
         request_id,
-        0,
-        0
+        yaw_deg
     );
 }
 
-ER imu_service_cancel(void) {
-    return send_command(
-        CMD_CANCEL,
-        0,
-        0,
-        0
-    );
-}
-
-ER imu_service_reinit(void) {
+ER imu_service_reinit(UW request_id) {
     return send_command(
         CMD_REINIT,
-        0,
-        0,
-        0
+        request_id,
+        0.0f
     );
 }
 
-INT imu_service_poll(
-    imu_result_t *out
-) {
-    if (out == NULL ||
-        result_mbf <= 0) {
+/* -------------------------------------
+ * Receive service events
+ * ------------------------------------- */
+
+INT imu_service_poll(imu_result_t *out) {
+    if (out == NULL || result_mbf <= 0) {
         return E_PAR;
     }
 

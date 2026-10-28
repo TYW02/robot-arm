@@ -1,84 +1,104 @@
-
 #ifndef AAI17_IMU_SERVICE_H
 #define AAI17_IMU_SERVICE_H
 
 #include <tk/tkernel.h>
 #include "imu_mtk3.h"
 
+/* Events sent from the IMU service to the coordinator. */
 typedef enum {
     IMU_EVT_READY = 1,
-    IMU_EVT_SAMPLE,
-    IMU_EVT_VERIFIED,
-    IMU_EVT_OUT_OF_TOLERANCE,
-    IMU_EVT_FAULT,
-    IMU_EVT_CANCELLED
+    IMU_EVT_REFERENCE_SET,
+    IMU_EVT_FAULT
 } imu_event_t;
 
 typedef struct {
-    UW request_id;
     UW event;
 
-    imu_sample_t sample;
+    /*
+     * Matches the command that produced this result.
+     * Zero is reserved for startup and unsolicited faults.
+     */
+    UW request_id;
 
-    /* 1 = RP2040 physical core 0 */
+    /* E_OK on success; a negative error code on failure. */
+    ER error;
+
+    /*
+     * Number of earlier events that could not be queued.
+     * The coordinator must also time out missing replies.
+     */
+    UW dropped_events;
+
+    /* Processor 1 = RP2040 physical core 0. */
     INT producer_core;
 } imu_result_t;
 
 /*
- * Start the IMU Task.
+ * Start the IMU service task.
  *
- * Call from an existing kernel task,
- * after I2C1 has been initialised.
+ * Call from an existing kernel task after I2C1 setup.
+ * All I2C1 users must share the supplied mutex.
  *
- * Motion must use the same I2C mutex.
+ * E_OK means the task started, not that calibration finished.
+ * Calibration completion is reported through IMU_EVT_READY.
+ *
+ * Keep the car stopped throughout startup calibration.
  */
-ER imu_service_start(
-    ID shared_i2c_mutex
-);
+ER imu_service_start(ID shared_i2c_mutex);
 
 /*
- * Request orientation verification.
+ * Copy the latest gyro/yaw sample without queuing a request.
  *
- * The Coordinator provides:
- * - unique request ID
- * - target pitch
- * - target roll
+ * Returns E_OK only when the angular-velocity sample is fresh
+ * and valid. Check out->heading_valid separately before using
+ * the yaw angle.
+ *
+ * On failure, the returned sample is cleared or marked invalid.
+ * Multiple tasks may call this function.
  */
-ER imu_service_verify(
+ER imu_service_latest(imu_sample_t *out);
+
+/*
+ * Request a new relative-yaw reference.
+ * Example: imu_service_set_yaw(request_id, 0.0f).
+ *
+ * The car must be stopped.
+ * This does not establish magnetic north.
+ *
+ * request_id must be nonzero.
+ * E_OK means the command was queued.
+ *
+ * Wait for IMU_EVT_REFERENCE_SET with the matching request_id,
+ * then obtain a fresh sample with the new reference_id.
+ */
+ER imu_service_set_yaw(
     UW request_id,
-    float pitch_deg,
-    float roll_deg
+    float yaw_deg
 );
 
 /*
- * Request latest IMU reading.
- * Intended for diagnostics/testing.
+ * Request sensor reinitialisation and gyro recalibration.
+ * Successful calibration sets relative yaw back to zero.
+ *
+ * Keep the car stopped throughout the operation.
+ * request_id must be nonzero.
+ *
+ * E_OK means the command was queued.
+ * Wait for IMU_EVT_READY or IMU_EVT_FAULT with the matching ID.
  */
-ER imu_service_snapshot(
-    UW request_id
-);
-
-/* Cancel current verification. */
-ER imu_service_cancel(void);
+ER imu_service_reinit(UW request_id);
 
 /*
- * Reinitialise and recalibrate.
- * Only use while the arm is stationary.
- */
-ER imu_service_reinit(void);
-
-/*
- * Receive results without blocking.
+ * Receive a service event without blocking.
  *
  * Returns:
- *  1 = result received
- *  0 = no result
- * <0 = error
+ *   1 = event received
+ *   0 = no event available
+ *  <0 = error
  *
- * Only one task should consume results.
+ * Only one coordinator task should consume these events.
+ * Obtain sensor readings through imu_service_latest().
  */
-INT imu_service_poll(
-    imu_result_t *out
-);
+INT imu_service_poll(imu_result_t *out);
 
 #endif

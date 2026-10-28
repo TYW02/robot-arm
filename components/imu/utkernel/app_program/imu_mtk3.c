@@ -1,90 +1,108 @@
 #include <stddef.h>
 
-// Use the standard library's size_t definition.
-// Prevent µT-Kernel from redefining it.
+/* Prevent µT-Kernel from redefining size_t. */
 #define PROHIBIT_DEF_SIZE_T
 
 #include "imu_mtk3.h"
 #include <tk/device.h>
 #include "../device/include/dev_i2c.h"
+
 #include <math.h>
 #include <string.h>
 
-
+/* MPU-6500 address and registers. */
 #define MPU_ADDR        0x68U
 #define WHO_AM_I_REG    0x75U
 #define PWR_MGMT_1      0x6BU
-#define ACCEL_CONFIG    0x1CU
+#define PWR_MGMT_2      0x6CU
+#define SMPLRT_DIV      0x19U
+#define CONFIG          0x1AU
 #define GYRO_CONFIG     0x1BU
-#define SENSOR_BLOCK    0x3BU
+#define INT_ENABLE      0x38U
+#define INT_STATUS      0x3AU
+#define GYRO_OUT        0x43U
 
-#define DEG_PER_RAD     57.2957795f
-#define GYRO_SCALE      131.0f
-#define ACCEL_SCALE     16384.0f
+/* +/-250 degrees/second. */
+#define GYRO_SCALE              131.0f
 
-#define MAX_GAP_MS      50U
-#define BUS_TIMEOUT_MS  10
+/*
+ * This timeout applies to acquiring the shared mutex.
+ * The kernel I2C driver has its own transfer timeout.
+ */
+#define BUS_LOCK_TIMEOUT_MS     10
+
+#define CALIBRATION_SAMPLES     200
+#define CALIBRATION_MAX_DPS     10.0f
+#define CALIBRATION_MAX_VAR     0.25f
+#define LOW_RATE_DPS            1.0f
+#define RAW_SATURATION_LIMIT    32700
+
+#if IMU_YAW_AXIS < 0 || IMU_YAW_AXIS > 2
+#error "IMU_YAW_AXIS must be 0, 1 or 2"
+#endif
+
+#if IMU_YAW_SIGN != 1 && IMU_YAW_SIGN != -1
+#error "IMU_YAW_SIGN must be 1 or -1"
+#endif
 
 static ID device_id = 0;
 static ID shared_mutex = 0;
 
-static float gx_bias = 0;
-static float gy_bias = 0;
-static float gz_bias = 0;
-
-static float pitch_deg = 0;
-static float roll_deg = 0;
+static float gyro_bias[3] = {0};
+static float yaw_deg = 0;
 
 static UW last_ms = 0;
-static INT filter_valid = 0;
+static UW sequence = 0;
+static UW reference_id = 0;
 
-/* Detect repeated identical sensor readings. */
-static H previous_raw[6];
-static INT previous_raw_available = 0;
-static UINT identical_raw_count = 0;
+static INT calibrated = 0;
+static INT heading_valid = 0;
+
+static imu_sample_t latest_sample = {0};
 
 /* -------------------------------------
  * Time
  * ------------------------------------- */
 
-UW imu_mtk3_now_ms(void) {
-    SYSTIM t;
+static INT get_time_ms(UW *out) {
+    SYSTIM time;
 
-    if (tk_get_otm(&t) != E_OK) {
+    if (tk_get_otm(&time) != E_OK) {
         return 0;
     }
 
-    return t.lo;
+    *out = time.lo;
+    return 1;
+}
+
+UW imu_mtk3_now_ms(void) {
+    UW now = 0;
+    (void)get_time_ms(&now);
+    return now;
 }
 
 /* -------------------------------------
- * I2C register read
+ * I2C register access
  * ------------------------------------- */
 
-static INT get_registers(
-    UB reg,
-    UB *data,
-    SZ count
-) {
-    UB address = reg;
+static INT get_registers(UB reg, UB *data, SZ count) {
     T_I2C_EXEC transfer = {0};
     SZ actual = 0;
 
-    if (device_id <= 0 ||
-        shared_mutex <= 0) {
+    if (device_id <= 0 || shared_mutex <= 0) {
         return 0;
     }
 
     if (tk_loc_mtx(
             shared_mutex,
-            BUS_TIMEOUT_MS
+            BUS_LOCK_TIMEOUT_MS
         ) != E_OK) {
         return 0;
     }
 
     transfer.sadr = MPU_ADDR;
     transfer.snd_size = 1;
-    transfer.snd_data = &address;
+    transfer.snd_data = &reg;
     transfer.rcv_size = count;
     transfer.rcv_data = data;
 
@@ -102,25 +120,17 @@ static INT get_registers(
            actual == (SZ)sizeof(transfer);
 }
 
-/* -------------------------------------
- * I2C register write
- * ------------------------------------- */
-
-static INT put_register(
-    UB reg,
-    UB value
-) {
+static INT put_register(UB reg, UB value) {
     UB bytes[2] = {reg, value};
     SZ actual = 0;
 
-    if (device_id <= 0 ||
-        shared_mutex <= 0) {
+    if (device_id <= 0 || shared_mutex <= 0) {
         return 0;
     }
 
     if (tk_loc_mtx(
             shared_mutex,
-            BUS_TIMEOUT_MS
+            BUS_LOCK_TIMEOUT_MS
         ) != E_OK) {
         return 0;
     }
@@ -139,102 +149,81 @@ static INT put_register(
            actual == (SZ)sizeof(bytes);
 }
 
-/* -------------------------------------
- * Raw sensor data
- * ------------------------------------- */
+/* Write a configuration register and verify its value. */
+static INT configure_register(UB reg, UB value) {
+    UB actual = 0;
 
-static H signed_word(
-    UB high,
-    UB low
-) {
-    return (H)(((UH)high << 8) | low);
+    return put_register(reg, value) &&
+           get_registers(reg, &actual, 1) &&
+           actual == value;
 }
 
-static INT get_raw(
-    H *ax, H *ay, H *az,
-    H *gx, H *gy, H *gz
-) {
-    UB data[14];
+/* -------------------------------------
+ * Raw gyroscope readings
+ * ------------------------------------- */
 
-    if (!get_registers(
-            SENSOR_BLOCK,
-            data,
-            sizeof(data))) {
+static INT get_raw_gyro(H raw[3]) {
+    UB data[6];
+
+    if (!get_registers(GYRO_OUT, data, sizeof(data))) {
         return 0;
     }
 
-    *ax = signed_word(data[0], data[1]);
-    *ay = signed_word(data[2], data[3]);
-    *az = signed_word(data[4], data[5]);
-
-    *gx = signed_word(data[8], data[9]);
-    *gy = signed_word(data[10], data[11]);
-    *gz = signed_word(data[12], data[13]);
+    for (INT axis = 0; axis < 3; axis++) {
+        raw[axis] = (H)(
+            ((UH)data[axis * 2] << 8) |
+            data[axis * 2 + 1]
+        );
+    }
 
     return 1;
 }
 
-/* -------------------------------------
- * Calculate accelerometer angles
- * ------------------------------------- */
+/*
+ * Used during calibration only.
+ * Wait briefly for a fresh sensor reading.
+ */
+static INT wait_for_gyro(void) {
+    for (INT attempt = 0; attempt < 25; attempt++) {
+        UB status = 0;
 
-static INT accel_angles(
-    H ax, H ay, H az,
-    float *new_pitch,
-    float *new_roll,
-    float *magnitude
-) {
-    float x = (float)ax / ACCEL_SCALE;
-    float y = (float)ay / ACCEL_SCALE;
-    float z = (float)az / ACCEL_SCALE;
+        if (!get_registers(INT_STATUS, &status, 1)) {
+            return 0;
+        }
 
-    float m2 = x*x + y*y + z*z;
+        if ((status & 0x01U) != 0) {
+            return 1;
+        }
 
-    /*
-     * Reject implausible acceleration.
-     * Normal stationary magnitude is ~1g.
-     */
-    if (!isfinite(m2) ||
-        m2 < 0.64f ||
-        m2 > 1.44f) {
-        return 0;
+        (void)tk_dly_tsk(2);
     }
 
-    *magnitude = sqrtf(m2);
+    return 0;
+}
 
-    *new_roll =
-        atan2f(y, z) * DEG_PER_RAD;
+/* Convert an angle to [-180, 180). */
+static float wrap_yaw(float angle) {
+    float wrapped = remainderf(angle, 360.0f);
 
-    *new_pitch =
-        atan2f(
-            -x,
-            sqrtf(y*y + z*z)
-        ) * DEG_PER_RAD;
+    if (wrapped >= 180.0f) {
+        wrapped -= 360.0f;
+    }
 
-    return isfinite(*new_pitch) &&
-           isfinite(*new_roll);
+    return wrapped;
 }
 
 /* -------------------------------------
- * Initialise MPU-6500
+ * Initialisation and calibration
  * ------------------------------------- */
 
-ER imu_mtk3_init(
-    ID shared_i2c_mutex
-) {
-    UB who = 0;
+ER imu_mtk3_init(ID shared_i2c_mutex) {
+    calibrated = 0;
+    heading_valid = 0;
+    yaw_deg = 0;
 
-    H ax, ay, az;
-    H gx, gy, gz;
+    memset(&latest_sample, 0, sizeof(latest_sample));
+    latest_sample.status = IMU_STATUS_NOT_READY;
 
-    float sum_x = 0;
-    float sum_y = 0;
-    float sum_z = 0;
-    float magnitude;
-
-    filter_valid = 0;
-    previous_raw_available = 0;
-    identical_raw_count = 0;
     shared_mutex = shared_i2c_mutex;
 
     if (shared_mutex <= 0) {
@@ -242,7 +231,7 @@ ER imu_mtk3_init(
     }
 
     /*
-     * The repository registers I2C1 as "iicb".
+     * I2C1 is registered as "iicb".
      * GP6 = SDA, GP7 = SCL.
      */
     if (device_id <= 0) {
@@ -256,258 +245,280 @@ ER imu_mtk3_init(
         }
     }
 
-    /*
-     * MPU-6500 WHO_AM_I should be 0x70.
-     */
-    if (!get_registers(
-            WHO_AM_I_REG,
-            &who,
-            1
-        ) || who != 0x70) {
+    UB who = 0;
+
+    if (!get_registers(WHO_AM_I_REG, &who, 1) ||
+        who != 0x70U) {
         return E_IO;
     }
 
-    /* Wake up the MPU-6500. */
-    if (!put_register(
-            PWR_MGMT_1,
-            0x01
-        )) {
+    /* Reset the sensor to known settings. */
+    if (!put_register(PWR_MGMT_1, 0x80U)) {
         return E_IO;
     }
 
-    /* Give the sensor time to wake up. */
     (void)tk_dly_tsk(100);
 
-    /* Read back the power management register. */
-    UB power_state = 0xFF;
-
-    if (!get_registers(
-            PWR_MGMT_1,
-            &power_state,
-            1
-        )) {
+    /*
+     * Wake sensor and select automatic PLL clock.
+     * Disable accelerometers; keep all gyro axes enabled.
+     *
+     * Gyro range: +/-250 dps.
+     * Gyro low-pass bandwidth: 20 Hz.
+     * Output rate: 1000 / (1 + 9) = 100 Hz.
+     */
+    if (!configure_register(PWR_MGMT_1, 0x01U) ||
+        !configure_register(PWR_MGMT_2, 0x38U) ||
+        !configure_register(GYRO_CONFIG, 0x00U) ||
+        !configure_register(CONFIG, 0x04U) ||
+        !configure_register(SMPLRT_DIV, 9U) ||
+        !configure_register(INT_ENABLE, 0x01U)) {
         return E_IO;
     }
 
-    /* Check that sleep mode is disabled. */
-    if ((power_state & 0x40U) != 0) {
-        return E_IO;
-    }
-
-    /* Check that the clock source is set correctly. */
-    if ((power_state & 0x07U) != 0x01U) {
-        return E_IO;
-    }
-
-    /* +/-2g accelerometer, +/-250 dps gyro. */
-    if (!put_register(ACCEL_CONFIG, 0x00) ||
-        !put_register(GYRO_CONFIG, 0x00)) {
-        return E_IO;
-    }
+    (void)tk_dly_tsk(100);
 
     /*
-     * Calibrate gyroscope offsets.
-     * IMU must remain stationary.
+     * Keep the car stopped throughout calibration.
+     *
+     * Calculate the mean and variance of each gyro axis.
+     * These checks detect gross motion and unstable readings,
+     * but cannot distinguish constant slow rotation from bias.
      */
-    for (INT i = 0; i < 100; i++) {
-        if (!get_raw(
-                &ax, &ay, &az,
-                &gx, &gy, &gz)) {
+    float mean[3] = {0};
+    float variance_sum[3] = {0};
+
+    for (INT n = 1; n <= CALIBRATION_SAMPLES; n++) {
+        H raw[3];
+
+        if (!wait_for_gyro() || !get_raw_gyro(raw)) {
             return E_IO;
         }
 
-        sum_x += (float)gx / GYRO_SCALE;
-        sum_y += (float)gy / GYRO_SCALE;
-        sum_z += (float)gz / GYRO_SCALE;
+        for (INT axis = 0; axis < 3; axis++) {
+            float rate = (float)raw[axis] / GYRO_SCALE;
 
-        (void)tk_dly_tsk(5);
+            if (fabsf(rate) > CALIBRATION_MAX_DPS) {
+                return E_IO;
+            }
+
+            float difference = rate - mean[axis];
+
+            mean[axis] += difference / (float)n;
+
+            variance_sum[axis] +=
+                difference * (rate - mean[axis]);
+        }
+
+        (void)tk_dly_tsk(10);
     }
 
-    gx_bias = sum_x / 100.0f;
-    gy_bias = sum_y / 100.0f;
-    gz_bias = sum_z / 100.0f;
+    for (INT axis = 0; axis < 3; axis++) {
+        float variance =
+            variance_sum[axis] /
+            (float)(CALIBRATION_SAMPLES - 1);
 
-    /*
-     * Establish initial pitch/roll.
-     */
-    if (!get_raw(
-            &ax, &ay, &az,
-            &gx, &gy, &gz)) {
+        if (variance > CALIBRATION_MAX_VAR) {
+            return E_IO;
+        }
+
+        gyro_bias[axis] = mean[axis];
+    }
+
+    if (!get_time_ms(&last_ms)) {
         return E_IO;
     }
 
-    if (!accel_angles(
-            ax, ay, az,
-            &pitch_deg,
-            &roll_deg,
-            &magnitude)) {
-        return E_IO;
-    }
-
-    last_ms = imu_mtk3_now_ms();
-    filter_valid = 1;
+    reference_id++;
+    calibrated = 1;
+    heading_valid = 1;
 
     return E_OK;
 }
 
 /* -------------------------------------
- * Read and update orientation
+ * Invalid-sample handling
  * ------------------------------------- */
 
-INT imu_mtk3_read(
-    imu_sample_t *out
+static INT reject_sample(
+    imu_sample_t *out,
+    imu_status_t status
 ) {
-    H ax, ay, az;
-    H gx, gy, gz;
+    /*
+     * Missing rotation cannot be recovered from a later
+     * gyro reading. Require an explicit new reference.
+     */
+    heading_valid = 0;
 
-    float accel_pitch;
-    float accel_roll;
-    float magnitude;
+    out->rate_valid = 0;
+    out->heading_valid = 0;
+    out->low_rate = 0;
+    out->status = status;
 
+    latest_sample = *out;
+    return 0;
+}
+
+/* -------------------------------------
+ * Read gyro and update relative yaw
+ * ------------------------------------- */
+
+INT imu_mtk3_read(imu_sample_t *out) {
     if (out == NULL) {
         return 0;
     }
 
     memset(out, 0, sizeof(*out));
 
-    
-    if (!get_raw(
-            &ax, &ay, &az,
-            &gx, &gy, &gz)) {
-        filter_valid = 0;
-        return 0;
+    out->sequence = ++sequence;
+    out->reference_id = reference_id;
+    out->calibrated = calibrated;
+
+    out->yaw_deg = yaw_deg;
+    out->yaw_wrapped_deg = wrap_yaw(yaw_deg);
+
+    if (!get_time_ms(&out->timestamp_ms)) {
+        return reject_sample(out, IMU_STATUS_TIMING);
     }
 
-    // Store the raw sensor values
-    out->raw_ax = ax;
-    out->raw_ay = ay;
-    out->raw_az = az;
-
-    out->raw_gx = gx;
-    out->raw_gy = gy;
-    out->raw_gz = gz;
-
-    /* Compare all six raw sensor readings. */
-    H current_raw[6] = {
-        ax, ay, az, gx, gy, gz
-    };
-
-    if (previous_raw_available &&
-        memcmp(previous_raw,
-            current_raw,
-            sizeof(current_raw)) == 0) {
-
-        identical_raw_count++;
-
-    } else {
-        identical_raw_count = 0;
+    if (!calibrated) {
+        return reject_sample(out, IMU_STATUS_NOT_READY);
     }
 
-    /* Save the current readings for next time. */
-    memcpy(previous_raw,
-        current_raw,
-        sizeof(current_raw));
+    UB status = 0;
 
-    previous_raw_available = 1;
-
-    /* Reject potentially frozen sensor data. */
-    if (identical_raw_count >= 10U) {
-        filter_valid = 0;
-        out->valid = 0;
-        return 0;
+    if (!get_registers(INT_STATUS, &status, 1)) {
+        return reject_sample(out, IMU_STATUS_IO);
     }
 
-    // Calculate pitch and roll
-    if (!accel_angles(
-            ax, ay, az,
-            &accel_pitch,
-            &accel_roll,
-            &magnitude)) {
-        filter_valid = 0;
-        return 0;
+    if ((status & 0x01U) == 0) {
+        return reject_sample(out, IMU_STATUS_NO_DATA);
     }
 
+    H raw[3];
 
-    UW now = imu_mtk3_now_ms();
-    UW gap = now - last_ms;
+    if (!get_raw_gyro(raw)) {
+        return reject_sample(out, IMU_STATUS_IO);
+    }
 
+    UW now;
+
+    if (!get_time_ms(&now)) {
+        return reject_sample(out, IMU_STATUS_TIMING);
+    }
+
+    /*
+     * Unsigned subtraction also handles wraparound
+     * of the millisecond counter.
+     */
+    UW interval = now - last_ms;
     last_ms = now;
 
     out->timestamp_ms = now;
-    out->interval_ms = gap;
-    out->accel_g = magnitude;
+    out->interval_ms = interval;
 
-    INT on_time =
-        gap > 0 &&
-        gap <= MAX_GAP_MS;
+    out->raw_gx = raw[0];
+    out->raw_gy = raw[1];
+    out->raw_gz = raw[2];
 
-    float gyro_x =
-        (float)gx / GYRO_SCALE - gx_bias;
+    float rate[3];
 
-    float gyro_y =
-        (float)gy / GYRO_SCALE - gy_bias;
-
-    float gyro_z =
-        (float)gz / GYRO_SCALE - gz_bias;
-
-    out->gyro_rate_dps = sqrtf(
-        gyro_x*gyro_x +
-        gyro_y*gyro_y +
-        gyro_z*gyro_z
-    );
-
-    /*
-     * Stationary threshold is preliminary.
-     * Validate this on the actual robotic arm.
-     */
-    out->stationary =
-        out->gyro_rate_dps <= 3.0f &&
-        magnitude >= 0.85f &&
-        magnitude <= 1.15f;
-
-    /*
-     * Complementary filter.
-     *
-     * After a delayed sample, recover the
-     * filter but reject that reading.
-     */
-    if (!filter_valid || !on_time) {
-        roll_deg = accel_roll;
-        pitch_deg = accel_pitch;
-    } else {
-        float dt =
-            (float)gap * 0.001f;
-
-        float predicted_roll =
-            roll_deg + gyro_x * dt;
-
-        float roll_error =
-            remainderf(
-                accel_roll - predicted_roll,
-                360.0f
-            );
-
-        roll_deg = remainderf(
-            predicted_roll +
-            0.02f * roll_error,
-            360.0f
-        );
-
-        pitch_deg =
-            0.98f * (
-                pitch_deg + gyro_y * dt
-            ) +
-            0.02f * accel_pitch;
+    for (INT axis = 0; axis < 3; axis++) {
+        rate[axis] =
+            (float)raw[axis] / GYRO_SCALE -
+            gyro_bias[axis];
     }
 
-    filter_valid =
-        on_time &&
-        isfinite(pitch_deg) &&
-        isfinite(roll_deg);
+    out->gyro_x_dps = rate[0];
+    out->gyro_y_dps = rate[1];
+    out->gyro_z_dps = rate[2];
 
-    out->pitch_deg = pitch_deg;
-    out->roll_deg = roll_deg;
-    out->valid = filter_valid;
+    out->yaw_rate_dps =
+        (float)IMU_YAW_SIGN * rate[IMU_YAW_AXIS];
 
-    return out->valid;
+    /* Reject readings close to the gyro's full-scale limit. */
+    for (INT axis = 0; axis < 3; axis++) {
+        if (raw[axis] >= RAW_SATURATION_LIMIT ||
+            raw[axis] <= -RAW_SATURATION_LIMIT) {
+            return reject_sample(
+                out,
+                IMU_STATUS_SATURATED
+            );
+        }
+    }
+
+    if (interval == 0 || interval > IMU_MAX_GAP_MS) {
+        return reject_sample(out, IMU_STATUS_TIMING);
+    }
+
+    out->rate_valid = 1;
+
+    out->low_rate =
+        fabsf(rate[0]) <= LOW_RATE_DPS &&
+        fabsf(rate[1]) <= LOW_RATE_DPS &&
+        fabsf(rate[2]) <= LOW_RATE_DPS;
+
+    /*
+     * Integrate only while the heading reference is valid.
+     * Do not suppress small rates: slow turns still count.
+     */
+    if (heading_valid) {
+        float elapsed_seconds = (float)interval * 0.001f;
+
+        yaw_deg += out->yaw_rate_dps * elapsed_seconds;
+    }
+
+    out->yaw_deg = yaw_deg;
+    out->yaw_wrapped_deg = wrap_yaw(yaw_deg);
+    out->heading_valid = heading_valid;
+    out->status = IMU_STATUS_OK;
+
+    latest_sample = *out;
+
+    /*
+     * The rate is usable even if heading_valid is false.
+     * Consumers must check both flags when using yaw.
+     */
+    return 1;
+}
+
+/* -------------------------------------
+ * Establish a new relative-yaw reference
+ * ------------------------------------- */
+
+ER imu_mtk3_set_yaw(float new_yaw_deg) {
+    UW now;
+
+    if (!isfinite(new_yaw_deg) ||
+        fabsf(new_yaw_deg) > 1000000.0f) {
+        return E_PAR;
+    }
+
+    if (!get_time_ms(&now)) {
+        return E_IO;
+    }
+
+    /*
+     * The caller must ensure the car is stopped.
+     * A fresh low-rate gyro sample is an additional check,
+     * not proof that the wheels have stopped.
+     */
+    if (!calibrated ||
+        !latest_sample.rate_valid ||
+        !latest_sample.low_rate ||
+        (UW)(now - latest_sample.timestamp_ms) >
+            IMU_MAX_GAP_MS) {
+        return E_OBJ;
+    }
+
+    yaw_deg = new_yaw_deg;
+    last_ms = now;
+    reference_id++;
+    heading_valid = 1;
+
+    /* A fresh sample is required before another reset. */
+    latest_sample.rate_valid = 0;
+    latest_sample.heading_valid = 0;
+
+    return E_OK;
 }
