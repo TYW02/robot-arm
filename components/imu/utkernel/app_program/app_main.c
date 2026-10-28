@@ -1,6 +1,10 @@
+#include <stddef.h>
+
+/* Use the C library's size_t definition. */
+#define PROHIBIT_DEF_SIZE_T
+
 #include <tk/tkernel.h>
 #include <tm/tmonitor.h>
-
 #include <math.h>
 
 #include "imu_service.h"
