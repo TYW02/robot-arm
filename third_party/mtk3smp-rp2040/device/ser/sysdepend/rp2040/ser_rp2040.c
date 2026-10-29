@@ -122,13 +122,20 @@ void usart_inthdr( UINT intno)
 	out_w(UART_ICR(unit), -1);		// Clear interrupt
 	ClearInt(intno);
 
-	/* Reception process */
-	if( mis & UART_MIS_RX) {
-		data = in_w(UART_DR(unit));
-		if(data & UART_DR_ERR) {
-			dev_ser_notify_err(unit, (data>>8)&0x0F);	/* Notify the main process of this error. */
-		} else {
-			dev_ser_notify_rcv(unit, data & UART_DR_DATA);	/* Notify the main process of data reception. */
+	/*
+	 * Reception process. Drain the whole FIFO on both the threshold and
+	 * receive-timeout interrupts. Reading only one byte on RX leaves the
+	 * final bytes of short packets below the FIFO threshold until later data
+	 * arrives, which can stall or overrun a bursty 115200-baud link.
+	 */
+	if( mis & (UART_MIS_RX | UART_MIS_RT)) {
+		while(!(in_w(UART_FR(unit)) & UART_FR_RXFE)) {
+			data = in_w(UART_DR(unit));
+			if(data & UART_DR_ERR) {
+				dev_ser_notify_err(unit, (data>>8)&0x0F);	/* Notify the main process of this error. */
+			} else {
+				dev_ser_notify_rcv(unit, data & UART_DR_DATA);	/* Notify the main process of data reception. */
+			}
 		}
 	}
 
@@ -205,7 +212,7 @@ EXPORT ER dev_ser_llctl( UW unit, INT cmd, UW parm)
 	
 	case LLD_SER_START:	/* Start communication */
 		out_w(UART_CR(unit), UART_CR_RXE | UART_CR_TXE);		// UART disable.
-		out_w(UART_IMSC(unit), UART_IMSC_RXIM | UART_IMSC_BEIM);	// Clear RXI Interrupt mask.
+		out_w(UART_IMSC(unit), UART_IMSC_RXIM | UART_IMSC_RTIM | UART_IMSC_BEIM);	// RX threshold, RX timeout, and break.
 		
 		out_w(UART_ICR(unit), 0);					// Clear interrupt
 		ClearInt(ll_devdat[unit].intno);
