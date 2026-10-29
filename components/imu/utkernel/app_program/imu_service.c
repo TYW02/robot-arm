@@ -4,7 +4,7 @@
 #define PROHIBIT_DEF_SIZE_T
 
 #include "imu_service.h"
-
+#include <tm/tmonitor.h>
 #include <math.h>
 #include <string.h>
 
@@ -159,6 +159,19 @@ static void imu_task(INT stacd, void *exinf) {
             if (healthy) {
                 fault_announced = 0;
             } else if (!fault_announced) {
+
+                /* Print the first fault that invalidated heading. */
+                tm_printf(
+                    (UB *)"\n[IMU FIRST FAULT] "
+                        "status=%d | interval=%ums "
+                        "| GX=%d GY=%d GZ=%d\n",
+                    sample.status,
+                    sample.interval_ms,
+                    sample.raw_gx,
+                    sample.raw_gy,
+                    sample.raw_gz
+                );
+
                 publish(
                     IMU_EVT_FAULT,
                     0,

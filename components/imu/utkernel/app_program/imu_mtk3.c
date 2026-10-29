@@ -22,13 +22,10 @@
 #define INT_STATUS      0x3AU
 #define GYRO_OUT        0x43U
 
-/* +/-250 degrees/second. */
-#define GYRO_SCALE              131.0f
+/* +/-500 degrees/second: GYRO_CONFIG FS_SEL = 1. */
+#define GYRO_SCALE              65.5f
 
-/*
- * This timeout applies to acquiring the shared mutex.
- * The kernel I2C driver has its own transfer timeout.
- */
+/* Mutex acquisition timeout, not the I2C transfer timeout. */
 #define BUS_LOCK_TIMEOUT_MS     10
 
 #define CALIBRATION_SAMPLES     200
@@ -36,6 +33,30 @@
 #define CALIBRATION_MAX_VAR     0.25f
 #define LOW_RATE_DPS            1.0f
 #define RAW_SATURATION_LIMIT    32700
+
+/*
+ * Startup stages:
+ *  0: Not started
+ *  1: Open I2C device
+ *  2: Check sensor identity
+ *  3: Reset sensor
+ *  4: Configure sensor
+ *  5: Calibration running
+ *  6: Establish time reference
+ *  7: Startup completed
+ *
+ * Calibration failure stages:
+ * 51: Status-register access failed
+ * 52: Fresh-data polling expired
+ * 53: Gyro-register access failed
+ * 54: Calibration angular rate exceeded limit
+ * 55: Calibration variance exceeded limit
+ */
+#define INIT_FAIL_STATUS_READ   51U
+#define INIT_FAIL_DATA_WAIT     52U
+#define INIT_FAIL_GYRO_READ     53U
+#define INIT_FAIL_RATE_LIMIT    54U
+#define INIT_FAIL_VARIANCE      55U
 
 #if IMU_YAW_AXIS < 0 || IMU_YAW_AXIS > 2
 #error "IMU_YAW_AXIS must be 0, 1 or 2"
@@ -49,7 +70,8 @@ static ID device_id = 0;
 static ID shared_mutex = 0;
 
 static float gyro_bias[3] = {0};
-static float yaw_deg = 0;
+static float yaw_deg = 0.0f;
+static float previous_yaw_rate_dps = 0.0f;
 
 static UW last_ms = 0;
 static UW sequence = 0;
@@ -58,11 +80,24 @@ static UW reference_id = 0;
 static INT calibrated = 0;
 static INT heading_valid = 0;
 
+/*
+ * Diagnostic scalars only.
+ * These getters do not provide an atomic multi-field snapshot.
+ */
+static volatile UW init_stage = 0;
+static volatile UW calibration_count = 0;
+
 static imu_sample_t latest_sample = {0};
 
-/* -------------------------------------
- * Time
- * ------------------------------------- */
+UW imu_mtk3_init_stage(void) {
+    return init_stage;
+}
+
+UW imu_mtk3_calibration_count(void) {
+    return calibration_count;
+}
+
+/* Time */
 
 static INT get_time_ms(UW *out) {
     SYSTIM time;
@@ -81,9 +116,7 @@ UW imu_mtk3_now_ms(void) {
     return now;
 }
 
-/* -------------------------------------
- * I2C register access
- * ------------------------------------- */
+/* I2C register access */
 
 static INT get_registers(UB reg, UB *data, SZ count) {
     T_I2C_EXEC transfer = {0};
@@ -93,10 +126,7 @@ static INT get_registers(UB reg, UB *data, SZ count) {
         return 0;
     }
 
-    if (tk_loc_mtx(
-            shared_mutex,
-            BUS_LOCK_TIMEOUT_MS
-        ) != E_OK) {
+    if (tk_loc_mtx(shared_mutex, BUS_LOCK_TIMEOUT_MS) != E_OK) {
         return 0;
     }
 
@@ -128,10 +158,7 @@ static INT put_register(UB reg, UB value) {
         return 0;
     }
 
-    if (tk_loc_mtx(
-            shared_mutex,
-            BUS_LOCK_TIMEOUT_MS
-        ) != E_OK) {
+    if (tk_loc_mtx(shared_mutex, BUS_LOCK_TIMEOUT_MS) != E_OK) {
         return 0;
     }
 
@@ -158,9 +185,7 @@ static INT configure_register(UB reg, UB value) {
            actual == value;
 }
 
-/* -------------------------------------
- * Raw gyroscope readings
- * ------------------------------------- */
+/* Raw gyroscope readings */
 
 static INT get_raw_gyro(H raw[3]) {
     UB data[6];
@@ -180,15 +205,50 @@ static INT get_raw_gyro(H raw[3]) {
 }
 
 /*
+ * Near-limit readings may indicate actual saturation or
+ * abnormal sensor/communication data.
+ */
+static INT raw_near_full_scale(const H raw[3]) {
+    for (INT axis = 0; axis < 3; axis++) {
+        if (raw[axis] >= RAW_SATURATION_LIMIT ||
+            raw[axis] <= -RAW_SATURATION_LIMIT) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static INT raw_has_multiple_saturated_axes(const H raw[3]) {
+    INT count = 0;
+
+    for (INT axis = 0; axis < 3; axis++) {
+        if (raw[axis] >= RAW_SATURATION_LIMIT ||
+            raw[axis] <= -RAW_SATURATION_LIMIT) {
+            count++;
+        }
+    }
+
+    return count >= 2;
+}
+
+/*
  * Used during calibration only.
- * Wait briefly for a fresh sensor reading.
+ *
+ * Returns:
+ *  1: Fresh gyro data is available.
+ *  0: Fresh-data polling expired.
+ * -1: Status-register access failed.
+ *
+ * The polling limit is not an exact wall-clock timeout:
+ * kernel delays and I2C operations also take time.
  */
 static INT wait_for_gyro(void) {
     for (INT attempt = 0; attempt < 25; attempt++) {
         UB status = 0;
 
         if (!get_registers(INT_STATUS, &status, 1)) {
-            return 0;
+            return -1;
         }
 
         if ((status & 0x01U) != 0) {
@@ -212,14 +272,15 @@ static float wrap_yaw(float angle) {
     return wrapped;
 }
 
-/* -------------------------------------
- * Initialisation and calibration
- * ------------------------------------- */
+/* Initialisation and calibration */
 
 ER imu_mtk3_init(ID shared_i2c_mutex) {
     calibrated = 0;
+    init_stage = 1;
+    calibration_count = 0;
     heading_valid = 0;
-    yaw_deg = 0;
+    yaw_deg = 0.0f;
+    previous_yaw_rate_dps = 0.0f;
 
     memset(&latest_sample, 0, sizeof(latest_sample));
     latest_sample.status = IMU_STATUS_NOT_READY;
@@ -245,12 +306,16 @@ ER imu_mtk3_init(ID shared_i2c_mutex) {
         }
     }
 
+    init_stage = 2;
+
     UB who = 0;
 
     if (!get_registers(WHO_AM_I_REG, &who, 1) ||
         who != 0x70U) {
         return E_IO;
     }
+
+    init_stage = 3;
 
     /* Reset the sensor to known settings. */
     if (!put_register(PWR_MGMT_1, 0x80U)) {
@@ -263,35 +328,60 @@ ER imu_mtk3_init(ID shared_i2c_mutex) {
      * Wake sensor and select automatic PLL clock.
      * Disable accelerometers; keep all gyro axes enabled.
      *
-     * Gyro range: +/-250 dps.
+     * Gyro range: +/-500 dps.
      * Gyro low-pass bandwidth: 20 Hz.
-     * Output rate: 1000 / (1 + 9) = 100 Hz.
+     * Sensor output rate: 1000 / (1 + 9) = 100 Hz.
      */
+    init_stage = 4;
+
     if (!configure_register(PWR_MGMT_1, 0x01U) ||
         !configure_register(PWR_MGMT_2, 0x38U) ||
-        !configure_register(GYRO_CONFIG, 0x00U) ||
+        !configure_register(GYRO_CONFIG, 0x08U) ||
         !configure_register(CONFIG, 0x04U) ||
         !configure_register(SMPLRT_DIV, 9U) ||
         !configure_register(INT_ENABLE, 0x01U)) {
         return E_IO;
     }
 
-    (void)tk_dly_tsk(100);
+     /*
+     * Initial settling period before measuring gyro bias.
+     * Keep the board stationary during this wait and calibration.
+     * This delay does not guarantee thermal stability.
+     */
+    (void)tk_dly_tsk(5000);
 
     /*
      * Keep the car stopped throughout calibration.
      *
-     * Calculate the mean and variance of each gyro axis.
-     * These checks detect gross motion and unstable readings,
-     * but cannot distinguish constant slow rotation from bias.
+     * Mean and variance checks detect gross movement and
+     * unstable readings. They cannot distinguish constant
+     * slow rotation from sensor bias.
      */
+    init_stage = 5;
+
     float mean[3] = {0};
     float variance_sum[3] = {0};
 
     for (INT n = 1; n <= CALIBRATION_SAMPLES; n++) {
+        /* Current attempted sample, not completed samples. */
+        calibration_count = (UW)n;
+
         H raw[3];
 
-        if (!wait_for_gyro() || !get_raw_gyro(raw)) {
+        INT ready = wait_for_gyro();
+
+        if (ready < 0) {
+            init_stage = INIT_FAIL_STATUS_READ;
+            return E_IO;
+        }
+
+        if (ready == 0) {
+            init_stage = INIT_FAIL_DATA_WAIT;
+            return E_TMOUT;
+        }
+
+        if (!get_raw_gyro(raw)) {
+            init_stage = INIT_FAIL_GYRO_READ;
             return E_IO;
         }
 
@@ -299,6 +389,7 @@ ER imu_mtk3_init(ID shared_i2c_mutex) {
             float rate = (float)raw[axis] / GYRO_SCALE;
 
             if (fabsf(rate) > CALIBRATION_MAX_DPS) {
+                init_stage = INIT_FAIL_RATE_LIMIT;
                 return E_IO;
             }
 
@@ -319,11 +410,14 @@ ER imu_mtk3_init(ID shared_i2c_mutex) {
             (float)(CALIBRATION_SAMPLES - 1);
 
         if (variance > CALIBRATION_MAX_VAR) {
+            init_stage = INIT_FAIL_VARIANCE;
             return E_IO;
         }
 
         gyro_bias[axis] = mean[axis];
     }
+
+    init_stage = 6;
 
     if (!get_time_ms(&last_ms)) {
         return E_IO;
@@ -333,12 +427,11 @@ ER imu_mtk3_init(ID shared_i2c_mutex) {
     calibrated = 1;
     heading_valid = 1;
 
+    init_stage = 7;
     return E_OK;
 }
 
-/* -------------------------------------
- * Invalid-sample handling
- * ------------------------------------- */
+/* Invalid-sample handling */
 
 static INT reject_sample(
     imu_sample_t *out,
@@ -349,6 +442,7 @@ static INT reject_sample(
      * gyro reading. Require an explicit new reference.
      */
     heading_valid = 0;
+    previous_yaw_rate_dps = 0.0f;
 
     out->rate_valid = 0;
     out->heading_valid = 0;
@@ -359,9 +453,7 @@ static INT reject_sample(
     return 0;
 }
 
-/* -------------------------------------
- * Read gyro and update relative yaw
- * ------------------------------------- */
+/* Read gyro and update relative yaw */
 
 INT imu_mtk3_read(imu_sample_t *out) {
     if (out == NULL) {
@@ -373,7 +465,6 @@ INT imu_mtk3_read(imu_sample_t *out) {
     out->sequence = ++sequence;
     out->reference_id = reference_id;
     out->calibrated = calibrated;
-
     out->yaw_deg = yaw_deg;
     out->yaw_wrapped_deg = wrap_yaw(yaw_deg);
 
@@ -401,16 +492,31 @@ INT imu_mtk3_read(imu_sample_t *out) {
         return reject_sample(out, IMU_STATUS_IO);
     }
 
+    /*
+     * Preserve the existing multi-axis saturation retry.
+     * A second normal reading does not prove the first
+     * reading was corrupt; this behaviour still needs
+     * investigation during hardware diagnosis.
+     */
+    if (raw_has_multiple_saturated_axes(raw)) {
+        H check[3];
+
+        if (!get_raw_gyro(check)) {
+            return reject_sample(out, IMU_STATUS_IO);
+        }
+
+        if (!raw_near_full_scale(check)) {
+            memcpy(raw, check, sizeof(raw));
+        }
+    }
+
     UW now;
 
     if (!get_time_ms(&now)) {
         return reject_sample(out, IMU_STATUS_TIMING);
     }
 
-    /*
-     * Unsigned subtraction also handles wraparound
-     * of the millisecond counter.
-     */
+    /* Unsigned subtraction handles timer wraparound. */
     UW interval = now - last_ms;
     last_ms = now;
 
@@ -436,15 +542,8 @@ INT imu_mtk3_read(imu_sample_t *out) {
     out->yaw_rate_dps =
         (float)IMU_YAW_SIGN * rate[IMU_YAW_AXIS];
 
-    /* Reject readings close to the gyro's full-scale limit. */
-    for (INT axis = 0; axis < 3; axis++) {
-        if (raw[axis] >= RAW_SATURATION_LIMIT ||
-            raw[axis] <= -RAW_SATURATION_LIMIT) {
-            return reject_sample(
-                out,
-                IMU_STATUS_SATURATED
-            );
-        }
+    if (raw_near_full_scale(raw)) {
+        return reject_sample(out, IMU_STATUS_SATURATED);
     }
 
     if (interval == 0 || interval > IMU_MAX_GAP_MS) {
@@ -460,13 +559,17 @@ INT imu_mtk3_read(imu_sample_t *out) {
 
     /*
      * Integrate only while the heading reference is valid.
-     * Do not suppress small rates: slow turns still count.
+     * Small rates are retained so slow turns still count.
      */
     if (heading_valid) {
         float elapsed_seconds = (float)interval * 0.001f;
 
-        yaw_deg += out->yaw_rate_dps * elapsed_seconds;
+        yaw_deg += 0.5f *
+            (previous_yaw_rate_dps + out->yaw_rate_dps) *
+            elapsed_seconds;
     }
+
+    previous_yaw_rate_dps = out->yaw_rate_dps;
 
     out->yaw_deg = yaw_deg;
     out->yaw_wrapped_deg = wrap_yaw(yaw_deg);
@@ -476,15 +579,13 @@ INT imu_mtk3_read(imu_sample_t *out) {
     latest_sample = *out;
 
     /*
-     * The rate is usable even if heading_valid is false.
-     * Consumers must check both flags when using yaw.
+     * A valid rate does not guarantee a valid heading.
+     * Consumers must check heading_valid before using yaw.
      */
     return 1;
 }
 
-/* -------------------------------------
- * Establish a new relative-yaw reference
- * ------------------------------------- */
+/* Establish a new relative-yaw reference */
 
 ER imu_mtk3_set_yaw(float new_yaw_deg) {
     UW now;
@@ -500,8 +601,8 @@ ER imu_mtk3_set_yaw(float new_yaw_deg) {
 
     /*
      * The caller must ensure the car is stopped.
-     * A fresh low-rate gyro sample is an additional check,
-     * not proof that the wheels have stopped.
+     * A fresh low-rate sample is an additional check,
+     * not proof that the car is stationary.
      */
     if (!calibrated ||
         !latest_sample.rate_valid ||
@@ -512,11 +613,12 @@ ER imu_mtk3_set_yaw(float new_yaw_deg) {
     }
 
     yaw_deg = new_yaw_deg;
+    previous_yaw_rate_dps = latest_sample.yaw_rate_dps;
     last_ms = now;
     reference_id++;
     heading_valid = 1;
 
-    /* A fresh sample is required before another reset. */
+    /* Require a fresh sample before another reference reset. */
     latest_sample.rate_valid = 0;
     latest_sample.heading_valid = 0;
 

@@ -100,4 +100,8 @@ ER imu_mtk3_set_yaw(float yaw_deg);
 /* Get µT-Kernel operating time in milliseconds. */
 UW imu_mtk3_now_ms(void);
 
+/* Temporary startup diagnostics. */
+UW imu_mtk3_init_stage(void);
+UW imu_mtk3_calibration_count(void);
+
 #endif
