@@ -4,6 +4,7 @@
 #define PROHIBIT_DEF_SIZE_T
 
 #include "imu_mtk3.h"
+#include <tm/tmonitor.h>
 #include <tk/device.h>
 #include "../device/include/dev_i2c.h"
 
@@ -404,16 +405,53 @@ ER imu_mtk3_init(ID shared_i2c_mutex) {
         (void)tk_dly_tsk(10);
     }
 
+        INT unstable = 0;
+
+    /*
+     * Print all three axes before deciding whether calibration
+     * passed. Values use thousandths of a degree per second.
+     */
+    INT limit_mdps =
+        (INT)(sqrtf(CALIBRATION_MAX_VAR) * 1000.0f);
+
     for (INT axis = 0; axis < 3; axis++) {
         float variance =
             variance_sum[axis] /
             (float)(CALIBRATION_SAMPLES - 1);
 
-        if (variance > CALIBRATION_MAX_VAR) {
-            init_stage = INIT_FAIL_VARIANCE;
-            return E_IO;
-        }
+        INT failed = variance > CALIBRATION_MAX_VAR;
 
+        INT mean_mdps =
+            (INT)(mean[axis] * 1000.0f);
+
+        INT std_mdps =
+            (INT)(sqrtf(variance) * 1000.0f);
+
+        tm_printf(
+            (UB *)"[GYRO CAL] Axis=%c "
+                   "| Mean=%d mdps "
+                   "| StdDev=%d mdps "
+                   "| Limit=%d mdps "
+                   "| %s\n",
+            (INT)('X' + axis),
+            mean_mdps,
+            std_mdps,
+            limit_mdps,
+            (UB *)(failed ? "FAIL" : "PASS")
+        );
+
+        if (failed) {
+            unstable = 1;
+        }
+    }
+
+    if (unstable) {
+        init_stage = INIT_FAIL_VARIANCE;
+        return E_IO;
+    }
+
+    /* Accept offsets only after every axis passes. */
+    for (INT axis = 0; axis < 3; axis++) {
         gyro_bias[axis] = mean[axis];
     }
 
