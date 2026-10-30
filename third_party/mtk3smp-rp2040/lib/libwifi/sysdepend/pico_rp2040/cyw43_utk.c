@@ -44,6 +44,9 @@
 #include "network_config.h"
 #endif
 
+/* Plain prototype: tmonitor.h cannot be included next to lwIP (type clash). */
+extern int tm_printf(const unsigned char *format, ...);
+
 #define CYW43_POLL_MS        2
 /* Bounded so a reader can never wedge if the writer is starved; an exhausted
  * budget returns the last copy and is visible through status_retries. */
@@ -65,9 +68,6 @@
 #endif
 
 extern uint64_t time_us_64(void);
-/* Plain prototype: tmonitor.h cannot be included next to lwIP (type clash). */
-extern int tm_printf(const unsigned char *format, ...);
-
 /* Log packets are sent only from this CYW43/lwIP owner task. */
 static struct udp_pcb *robot_log_pcb;
 static unsigned int robot_log_sent;
@@ -550,6 +550,34 @@ static int scan_result(void *env, const cyw43_ev_scan_result_t *result)
     if(result->rssi > status->strongest_rssi) {
         status->strongest_rssi = result->rssi;
     }
+#if TM_WIFI_JOIN
+    {
+        /* Print each access point once (up to 32) so a failed join can be
+         * compared with what the radio actually hears: name, channel, signal
+         * and security.  auth 0x400004 = WPA2, 0x1400004 = WPA2/WPA3,
+         * 0x1000004 = WPA3 only, 0 = open. */
+        static uint8_t seen[32][6];
+        static unsigned int seen_count;
+        unsigned int i, k;
+        char name[33];
+
+        for(i = 0; i < seen_count; i++) {
+            for(k = 0; k < 6 && seen[i][k] == result->bssid[k]; k++) {}
+            if(k == 6) return 0;
+        }
+        if(seen_count >= 32) return 0;
+        for(k = 0; k < 6; k++) seen[seen_count][k] = result->bssid[k];
+        seen_count++;
+        for(k = 0; k < result->ssid_len && k < 32; k++) {
+            name[k] = (char)result->ssid[k];
+        }
+        name[k] = '\0';
+        tm_printf((const unsigned char*)
+                  "[wifi-scan] \"%s\" ch=%d rssi=%d auth=0x%x\n",
+                  name, (int)result->channel, (int)result->rssi,
+                  (unsigned int)result->auth_mode);
+    }
+#endif
     return 0;
 }
 
@@ -705,6 +733,50 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
                 radio_status.join_result = -CYW43_ETIMEDOUT;
                 mp_memory_barrir();
                 radio_status.join_complete = 1;
+            }
+        }
+        {
+            /* Join diagnostics and retry.  The original code made a single
+             * join attempt and never tried again, so one failed attempt (hotspot
+             * not yet visible, phone screen asleep) left the radio offline until
+             * the next reboot.  Report every 3 s while offline, and retry 5 s
+             * after a failed attempt. */
+            static uint64_t next_report_us;
+            static uint64_t retry_at_us;
+            static unsigned int join_attempts = 1;
+            uint64_t t = time_us_64();
+
+            if(radio_status.join_started && !radio_status.link_up
+               && t >= next_report_us) {
+                next_report_us = t + 3000000ULL;
+                tm_printf((const unsigned char*)
+                    "[wifi] ssid=\"%s\" link=%d join_result=%d attempt=%u best_rssi=%d"
+                    " (link: 0 down, 1 joined, 2 no IP, 3 up, -1 failed,"
+                    " -2 SSID not found, -3 bad password)\n",
+                    (const char*)wifi_ssid, (int)radio_status.link_status,
+                    (int)radio_status.join_result, join_attempts,
+                    (int)radio_status.strongest_rssi);
+            }
+            if(radio_status.join_started && radio_status.join_complete
+               && radio_status.join_result != 0 && !radio_status.link_up) {
+                if(retry_at_us == 0) {
+                    retry_at_us = t + 5000000ULL;
+                } else if(t >= retry_at_us) {
+                    retry_at_us = 0;
+                    join_attempts++;
+                    radio_status.join_complete = 0;
+                    join_started_us = t;
+                    result = cyw43_wifi_join(&cyw43_state,
+                                             sizeof(wifi_ssid) - 1, wifi_ssid,
+                                             sizeof(wifi_password) - 1,
+                                             wifi_password, UTK_WIFI_AUTH,
+                                             NULL, CYW43_CHANNEL_NONE);
+                    radio_status.join_request_result = result;
+                    if(result != 0) {
+                        radio_status.join_result = result;
+                        radio_status.join_complete = 1;
+                    }
+                }
             }
         }
 #endif
