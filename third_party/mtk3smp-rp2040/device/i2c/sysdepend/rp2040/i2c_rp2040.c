@@ -12,6 +12,7 @@
  */
 
 #include <sys/machine.h>
+#include <tm/tmonitor.h>
 #ifdef CPU_RP2040
 
 #include <tk/tkernel.h>
@@ -83,154 +84,319 @@ LOCAL T_SPLOCK ll_lock[DEV_I2C_UNITNM];
 /*-------------------------------------------------------
  * Interrupt handler
  */
-LOCAL void i2c_inthdr( UINT intno )
-{
-	T_I2C_LLDCB	*p_cb;
-	UW		i2c_sts, cmd;
-	INT		unit;
-	BOOL		abort	= FALSE;
-	BOOL		wup	= FALSE;
-	UINT		intsts;
-
-	for ( unit = 0; unit < DEV_I2C_UNITNM; unit++ ) {
-		if ( ll_devdat[unit].intno == intno ) {
-			p_cb = &ll_devcb[unit];
-			break;
-		}
-	}
-	if(unit >= DEV_I2C_UNITNM) {
-		ClearInt(intno);	// Clear interrupt
-		return;
-	}
-	I2C_LOCK(unit, intsts);
-
-	i2c_sts = in_w(I2C_INTR_STAT(unit));
-	if(i2c_sts & I2C_INT_ERROR) abort = TRUE;
-
-	if(!abort) {
-	switch ( p_cb->state ) {
-	case I2C_STS_SEND:
-		if(i2c_sts & I2C_INT_TX_EMPTY) {
-			cmd = *(p_cb->sbuf)++ & I2C_DATA_CMD_DAT;
-			if(--(p_cb->sdat_num)) {
-				cmd |= I2C_DATA_CMD_CMD_WRITE;
-			} else {	// Last data
-				clr_w(I2C_INTR_MASK(unit), I2C_INT_TX_EMPTY);
-				if(p_cb->rdat_num) {
-					cmd |= I2C_DATA_CMD_CMD_WRITE | I2C_DATA_CMD_RESTART;
-					p_cb->state = I2C_STS_START;
-				} else {
-					cmd |= I2C_DATA_CMD_CMD_WRITE | I2C_DATA_CMD_STOP;
-					p_cb->state = I2C_STS_STOP;
-				}
-				wup = TRUE;
-			}
-			out_w(I2C_DATA_CMD(unit), cmd);			
-		} else {	// Error
-			abort = TRUE;	// Error
-		}
-		break;
-	case I2C_STS_RECV:
-		if(i2c_sts & I2C_INT_RX_FULL) {
-			*(p_cb->rbuf)++ = in_w(I2C_DATA_CMD(unit)) & I2C_DATA_CMD_DAT;
-			if (--(p_cb->rdat_num)) {
-				cmd = I2C_DATA_CMD_CMD_READ;
-				if (p_cb->rdat_num == 1) {
-					cmd |= I2C_DATA_CMD_STOP;
-				}
-				out_w(I2C_DATA_CMD(unit), cmd);
-			} else {	// Last data
-				clr_w(I2C_INTR_MASK(unit), I2C_INT_RX_FULL);
-				p_cb->state = I2C_STS_STOP;
-				wup = TRUE;
-			}
-		} else {
-			abort = TRUE;	// Error
-		}
-		break;
-	default:
-		abort = TRUE;	// Error
-	}
-	}
-
-	if(abort) {
-		out_w(I2C_INTR_MASK(unit), 0);	// Mask all innterrupts
-		p_cb->ioerr = E_IO;
-		p_cb->err_reason = i2c_sts;
-		p_cb->state = I2C_STS_STOP;
-		wup = TRUE;
-	}
-
-	(void)in_w(I2C_CLR_INTR(unit));	// Clear all Interrupt Registers
-	ClearInt(intno);		// Clear interrupt
-
-	if (wup) {
-		out_w(I2C_INTR_MASK(unit), 0);
-	}
-
-	I2C_UNLOCK(unit, intsts);
-
-	/* Wake the task after restoring the interrupt state. */
-	if (wup) {
-		(void)tk_set_flg(p_cb->done_flgid, 1);
-	}
-}
-/*----------------------------------------------------------------------
- * Execution of communication
+/*
+ * Wait for the bus STOP before declaring a transaction complete.
+ * This value is unused by the existing state definitions.
  */
+#define I2C_STS_WAIT_STOP 0x0006U
+
+/*
+ * Disabling the controller is asynchronous.
+ * Bound this short hardware wait using the RP2040 microsecond timer.
+ * Called from task context, without holding the spinlock.
+ */
+LOCAL ER i2c_wait_disabled(INT unit)
+{
+    UW started = in_w(TIMER_TIMERAWL);
+
+    while ((in_w(I2C_ENABLE_STATUS(unit)) & 1U) != 0U) {
+        if ((UW)(in_w(TIMER_TIMERAWL) - started) >= 2000U)
+            return E_TMOUT;
+    }
+
+    return E_OK;
+}
+
+/* Interrupt handler: advance one transaction, then wake its owner. */
+LOCAL void i2c_inthdr(UINT intno)
+{
+    INT unit;
+    UINT intsts;
+    UW status;
+    UW cmd;
+    BOOL abort = FALSE;
+    BOOL wake = FALSE;
+    T_I2C_LLDCB *p_cb;
+
+    for (unit = 0; unit < DEV_I2C_UNITNM; ++unit) {
+        if (ll_devdat[unit].intno == intno)
+            break;
+    }
+
+    if (unit >= DEV_I2C_UNITNM) {
+        ClearInt(intno);
+        return;
+    }
+
+    p_cb = &ll_devcb[unit];
+
+    I2C_LOCK(unit, intsts);
+    status = in_w(I2C_INTR_STAT(unit));
+
+    if ((status & I2C_INT_ERROR) != 0U) {
+        abort = TRUE;
+    } else {
+        switch (p_cb->state) {
+        case I2C_STS_SEND:
+            if ((status & I2C_INT_TX_EMPTY) != 0U) {
+                if (p_cb->sdat_num == 0U) {
+                    abort = TRUE;
+                    break;
+                }
+
+                cmd = (UW)(*p_cb->sbuf++) & I2C_DATA_CMD_DAT;
+                --p_cb->sdat_num;
+
+                if (p_cb->sdat_num != 0U) {
+                    out_w(I2C_DATA_CMD(unit), cmd);
+                } else if (p_cb->rdat_num != 0U) {
+                    /*
+                     * Combined register read:
+                     * queue the final write without STOP, then put
+                     * RESTART on the FIRST READ command.
+                     */
+                    out_w(I2C_DATA_CMD(unit), cmd);
+
+                    cmd = I2C_DATA_CMD_CMD_READ |
+                          I2C_DATA_CMD_RESTART;
+
+                    if (p_cb->rdat_num == 1U)
+                        cmd |= I2C_DATA_CMD_STOP;
+
+                    p_cb->state = I2C_STS_RECV;
+
+                    out_w(
+                        I2C_INTR_MASK(unit),
+                        I2C_INT_RX_FULL |
+                        I2C_INT_STOP_DET |
+                        I2C_INT_ERROR
+                    );
+
+                    out_w(I2C_DATA_CMD(unit), cmd);
+                } else {
+                    /*
+                     * Final write byte: request STOP, but do not
+                     * report completion until STOP is detected.
+                     */
+                    p_cb->state = I2C_STS_WAIT_STOP;
+
+                    out_w(
+                        I2C_INTR_MASK(unit),
+                        I2C_INT_STOP_DET | I2C_INT_ERROR
+                    );
+
+                    out_w(
+                        I2C_DATA_CMD(unit),
+                        cmd | I2C_DATA_CMD_STOP
+                    );
+                }
+            }
+            break;
+
+        case I2C_STS_RECV:
+            if ((status & I2C_INT_RX_FULL) != 0U) {
+                if (p_cb->rdat_num == 0U) {
+                    abort = TRUE;
+                    break;
+                }
+
+                *p_cb->rbuf++ = (UB)(
+                    in_w(I2C_DATA_CMD(unit)) &
+                    I2C_DATA_CMD_DAT
+                );
+
+                --p_cb->rdat_num;
+
+                if (p_cb->rdat_num != 0U) {
+                    cmd = I2C_DATA_CMD_CMD_READ;
+
+                    if (p_cb->rdat_num == 1U)
+                        cmd |= I2C_DATA_CMD_STOP;
+
+                    out_w(I2C_DATA_CMD(unit), cmd);
+                } else {
+                    p_cb->state = I2C_STS_WAIT_STOP;
+
+                    out_w(
+                        I2C_INTR_MASK(unit),
+                        I2C_INT_STOP_DET | I2C_INT_ERROR
+                    );
+                }
+            }
+            break;
+
+        case I2C_STS_WAIT_STOP:
+        case I2C_STS_STOP:
+            break;
+
+        default:
+            if (status != 0U)
+                abort = TRUE;
+            break;
+        }
+
+        if (!abort && (status & I2C_INT_STOP_DET) != 0U) {
+            (void)in_w(I2C_CLR_STOP_DET(unit));
+
+            if (p_cb->state == I2C_STS_WAIT_STOP &&
+                p_cb->sdat_num == 0U &&
+                p_cb->rdat_num == 0U) {
+                p_cb->state = I2C_STS_STOP;
+                wake = TRUE;
+            } else {
+                /* STOP occurred before all requested data completed. */
+                abort = TRUE;
+            }
+        }
+    }
+
+    if (abort) {
+        /*
+         * Preserve the hardware abort source BEFORE clearing it.
+         * Zero means this was another interrupt/state error.
+         */
+        p_cb->err_reason =
+            (status & I2C_INT_TX_ABRT) != 0U
+                ? in_w(I2C_TX_ABRT_SOURCE(unit))
+                : 0U;
+
+        p_cb->ioerr = E_IO;
+        p_cb->state = I2C_STS_STOP;
+        wake = TRUE;
+
+        (void)in_w(I2C_CLR_INTR(unit));
+    }
+
+    /*
+     * Do not indiscriminately clear all interrupts on the normal
+     * path: that can erase a newly arriving STOP indication.
+     */
+    if (wake)
+        out_w(I2C_INTR_MASK(unit), 0);
+
+    ClearInt(intno);
+    I2C_UNLOCK(unit, intsts);
+
+    /* Keep kernel wake-up outside the interrupt spinlock. */
+    if (wake)
+        (void)tk_set_flg(p_cb->done_flgid, 1);
+}
+
+/* Execute one complete transaction. */
 LOCAL ER i2c_trans(INT unit, T_I2C_LLDCB *p_cb)
 {
-	UW	cmd;
-	UINT	imask;
-	UINT	flgptn;
-	ER	err;
+    UINT intsts;
+    UINT flags;
+    ER err;
+    ER disabled;
+    UW cmd;
+    static UW error_count[DEV_I2C_UNITNM];
 
-	p_cb->ioerr = err = E_OK;
+    out_w(I2C_INTR_MASK(unit), 0);
+    out_w(I2C_ENABLE(unit), 0);
 
-	out_w(I2C_TAR(unit), p_cb->sadr & I2C_TAR_7BIT_ADR);	// Set slave address
-	out_w(I2C_INTR_MASK(unit), 0);				// Mask all innterrupts
-	out_w(I2C_ENABLE(unit), I2C_ENABLE_ENABLE);		// Enable I2C
-	(void)in_w(I2C_CLR_INTR(unit));				// Clear all Interrupt Registers
-	in_w(I2C_CLR_TX_ABRT(unit));				// Clear Transmit abort
+    err = i2c_wait_disabled(unit);
+    if (err != E_OK)
+        return err;
 
-	while (p_cb->state != I2C_STS_STOP) {
-		I2C_LOCK(unit, imask);
-		(void)tk_clr_flg(p_cb->done_flgid, 0);
-		if(p_cb->sdat_num > 0 ) {	/* Send */
-			set_w(I2C_INTR_MASK(unit), I2C_INT_TX_EMPTY|I2C_INT_ERROR);
-			p_cb->state = I2C_STS_SEND;
-		} else {			/* Receive */
-			if(p_cb->rdat_num > 1) {
-				cmd = I2C_DATA_CMD_CMD_READ;
-			} else {	// Last data
-				cmd = I2C_DATA_CMD_CMD_READ | I2C_DATA_CMD_STOP;
-			}
-			set_w(I2C_INTR_MASK(unit), I2C_INT_RX_FULL|I2C_INT_ERROR);
-			out_w(I2C_DATA_CMD(unit), cmd);				
-			p_cb->state = I2C_STS_RECV;
-		}
-		I2C_UNLOCK(unit, imask);
+    I2C_LOCK(unit, intsts);
 
-		if(p_cb->ioerr != E_OK) {
-			err = p_cb->ioerr;
-			break;
-		}
+    p_cb->ioerr = E_OK;
+    p_cb->err_reason = 0;
 
-		err = tk_wai_flg(p_cb->done_flgid, 1,
-				 TWF_ORW | TWF_BITCLR, &flgptn,
-				 ll_devdat[unit].timout);
-		if ( err < E_OK ) {
-			I2C_LOCK(unit, imask);
-			out_w(I2C_INTR_MASK(unit), 0);
-			p_cb->state = I2C_STS_STOP;
-			I2C_UNLOCK(unit, imask);
-			break;
-		}
-		else err = p_cb->ioerr;
-	}
-	out_w(I2C_ENABLE(unit), 0);				// Disable I2C
+    (void)tk_clr_flg(p_cb->done_flgid, 0);
+    (void)in_w(I2C_CLR_INTR(unit));
+    ClearInt(ll_devdat[unit].intno);
 
-	return err;
+    out_w(
+        I2C_TAR(unit),
+        p_cb->sadr & I2C_TAR_7BIT_ADR
+    );
+
+    if (p_cb->sdat_num != 0U) {
+        p_cb->state = I2C_STS_SEND;
+
+        out_w(
+            I2C_INTR_MASK(unit),
+            I2C_INT_TX_EMPTY | I2C_INT_ERROR
+        );
+
+        out_w(I2C_ENABLE(unit), I2C_ENABLE_ENABLE);
+    } else if (p_cb->rdat_num != 0U) {
+        p_cb->state = I2C_STS_RECV;
+
+        cmd = I2C_DATA_CMD_CMD_READ;
+        if (p_cb->rdat_num == 1U)
+            cmd |= I2C_DATA_CMD_STOP;
+
+        out_w(
+            I2C_INTR_MASK(unit),
+            I2C_INT_RX_FULL |
+            I2C_INT_STOP_DET |
+            I2C_INT_ERROR
+        );
+
+        out_w(I2C_ENABLE(unit), I2C_ENABLE_ENABLE);
+        out_w(I2C_DATA_CMD(unit), cmd);
+    } else {
+        I2C_UNLOCK(unit, intsts);
+        return E_PAR;
+    }
+
+    I2C_UNLOCK(unit, intsts);
+
+    /*
+     * The interrupt handler now handles the write-to-read
+     * transition itself. Wake once at transaction completion.
+     */
+    err = tk_wai_flg(
+        p_cb->done_flgid,
+        1,
+        TWF_ORW | TWF_BITCLR,
+        &flags,
+        ll_devdat[unit].timout
+    );
+
+    I2C_LOCK(unit, intsts);
+    out_w(I2C_INTR_MASK(unit), 0);
+
+    if (err == E_OK) {
+        err = p_cb->ioerr;
+
+        if (err == E_OK &&
+            (p_cb->state != I2C_STS_STOP ||
+             p_cb->sdat_num != 0U ||
+             p_cb->rdat_num != 0U)) {
+            err = E_IO;
+        }
+    }
+
+    p_cb->state = I2C_STS_STOP;
+    out_w(I2C_ENABLE(unit), 0);
+    I2C_UNLOCK(unit, intsts);
+
+    disabled = i2c_wait_disabled(unit);
+    if (err == E_OK)
+        err = disabled;
+
+    if (err != E_OK) {
+        UW count = ++error_count[unit];
+
+        /* Repeat enough to capture without flooding the terminal. */
+        if (count <= 4U || (count % 16U) == 0U) {
+            tm_printf(
+                (UB *)"[I2C ERROR] bus=%d addr=0x%02X "
+                       "error=%d abort=0x%08X count=%u\n",
+                unit,
+                (UINT)p_cb->sadr,
+                err,
+                (UINT)p_cb->err_reason,
+                count
+            );
+        }
+    }
+
+    return err;
 }
 
 /*----------------------------------------------------------------------
@@ -270,11 +436,22 @@ EXPORT W dev_i2c_llctl( UW unit, INT cmd, UW p1, UW p2, UW *pp)
 		out_w(I2C_TX_TL(unit), 0);
 		out_w(I2C_DMA_CR(unit), I2C_DMA_CR_RDMAE | I2C_DMA_CR_TDMAE);
 
-		/* Set Baudrate (400Kbts)*/
-		out_w(I2C_FS_SCL_HCNT(unit), 126);
-		out_w(I2C_FS_SCL_LCNT(unit), 187);
-		out_w(I2C_FS_SPKLEN(unit), 187/16);
-		out_w(I2C_SDA_HOLD(unit), 38);
+		        /*
+         * I2C0: magnetometer, approximately 100 kHz.
+         * I2C1: MPU, retain the existing approximately 400 kHz.
+         * Counts assume the configured 125 MHz system clock.
+         */
+        if (unit == DEV_I2C_0) {
+            out_w(I2C_FS_SCL_HCNT(unit), 500);
+            out_w(I2C_FS_SCL_LCNT(unit), 750);
+            out_w(I2C_FS_SPKLEN(unit), 750 / 16);
+        } else {
+            out_w(I2C_FS_SCL_HCNT(unit), 126);
+            out_w(I2C_FS_SCL_LCNT(unit), 187);
+            out_w(I2C_FS_SPKLEN(unit), 187 / 16);
+        }
+
+        out_w(I2C_SDA_HOLD(unit), 38);
 
 		/* I2C interrupt enable */
 		break;
