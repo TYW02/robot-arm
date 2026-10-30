@@ -14,7 +14,8 @@ typedef struct {
     float distance_mm;
 } aruco_result_t;
 
-aruco_result_t aruco_detect_frame(camera_fb_t *fb);
+int aruco_detect_frame(camera_fb_t *fb, float marker_size_mm,
+                       aruco_result_t *results, int result_capacity);
 
 #ifdef __cplusplus
 }
