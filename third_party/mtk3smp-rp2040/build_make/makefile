@@ -20,7 +20,7 @@ RM := rm -rf
 # the default goal and quietly leave the image stale.
 .DEFAULT_GOAL := all
 
-INCPATH = -I"../include" -I"../config" -I"../kernel/knlinc"
+INCPATH = -I"../include" -I"../config" -I"../kernel/knlinc" -I"../../../integration"
 
 -include sources.mk
 

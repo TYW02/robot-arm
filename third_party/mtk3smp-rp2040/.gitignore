@@ -14,6 +14,7 @@ build_make/.build_profile
 # Local Wi-Fi credentials. Copy config/wifi_credentials.example.h to this
 # path and edit it; never commit the populated file.
 config/wifi_credentials.h
+config/wifi_log_config.h
 config/network_config.h
 config/udp_test_config.h
 config/tcp_test_config.h

@@ -36,6 +36,7 @@ endif()
 
 add_custom_target(robotic_arm ALL
     COMMAND "${MTK_MAKE_EXECUTABLE}" SMP=1 CONSOLE=usb_cdc
+            WIFI=cyw43 WIFI_JOIN=1 WIFI_NETIF=1 WIFI_DHCP=1 WIFI_LOG=1
             "PICO_SDK_PATH=${PICO_SDK_PATH_MAKE}"
     WORKING_DIRECTORY "${MTK_BUILD_DIR}"
     USES_TERMINAL

@@ -28,6 +28,15 @@
 #if TM_WIFI_TCPBULK
 #include "lwip_utk_tcpbulk.h"
 #endif
+#if TM_WIFI_LOG
+#include "lwip/err.h"
+#include "lwip/ip.h"
+#include "lwip/ip4_addr.h"
+#include "lwip/pbuf.h"
+#include "lwip/udp.h"
+#include "wifi_log.h"
+#include "wifi_log_config.h"
+#endif
 #if TM_WIFI_STATIC || TM_WIFI_DHCP
 #include "lwip_utk_ipv4.h"
 #endif
@@ -42,6 +51,43 @@
 #define CYW43_JOIN_TIMEOUT_US 30000000ULL
 #define CYW43_DHCP_TIMEOUT_US 30000000ULL
 #define CYW43_DNS_TIMEOUT_US  30000000ULL
+
+#if TM_WIFI_LOG
+#define CYW43_UTK_LOG_PORT 5005U
+
+/* Log packets are sent only from this CYW43/lwIP owner task. */
+static struct udp_pcb *robot_log_pcb;
+
+static void robot_log_udp_poll(struct netif *netif)
+{
+    unsigned char bytes[240];
+    unsigned int length;
+    ip4_addr_t target_ipv4;
+    ip_addr_t destination;
+    struct pbuf *packet;
+
+    if(netif == NULL || !netif_is_up(netif) || !netif_is_link_up(netif)
+       || netif_ip4_addr(netif)->addr == 0) return;
+
+    if(robot_log_pcb == NULL) {
+        robot_log_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+        if(robot_log_pcb == NULL) return;
+    }
+
+    if(!robot_log_dequeue(bytes, sizeof(bytes), &length)) return;
+    packet = pbuf_alloc(PBUF_TRANSPORT, (u16_t)length, PBUF_RAM);
+    if(packet == NULL) return;
+    if(pbuf_take(packet, bytes, (u16_t)length) == ERR_OK) {
+        IP4_ADDR(&target_ipv4, UTK_WIFI_LOG_TARGET_A,
+                 UTK_WIFI_LOG_TARGET_B, UTK_WIFI_LOG_TARGET_C,
+                 UTK_WIFI_LOG_TARGET_D);
+        ip_addr_copy_from_ip4(destination, target_ipv4);
+        (void)udp_sendto_if(robot_log_pcb, packet, &destination,
+                            (u16_t)CYW43_UTK_LOG_PORT, netif);
+    }
+    pbuf_free(packet);
+}
+#endif
 
 #if TM_WIFI_JOIN
 #include "wifi_credentials.h"
@@ -514,6 +560,9 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
 #endif
 #if TM_WIFI_DHCP
         update_dhcp_status();
+#endif
+#if TM_WIFI_LOG
+        robot_log_udp_poll(&cyw43_state.netif[CYW43_ITF_STA]);
 #endif
 #if TM_WIFI_DNS
         update_dns_status();

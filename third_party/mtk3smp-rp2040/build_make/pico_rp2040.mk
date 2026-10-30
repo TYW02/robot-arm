@@ -77,6 +77,21 @@ WIFI_DHCP ?= 0
 ifneq ($(filter $(WIFI_DHCP),0 1),$(WIFI_DHCP))
 $(error Unknown WIFI_DHCP '$(WIFI_DHCP)'; use 0 or 1)
 endif
+
+# Application log forwarding over UDP broadcast.  It uses the ordinary DHCP
+# netif, but is separate from WIFI_UDP (the kernel's echo-test profile).
+WIFI_LOG ?= 0
+ifneq ($(filter $(WIFI_LOG),0 1),$(WIFI_LOG))
+$(error Unknown WIFI_LOG '$(WIFI_LOG)'; use 0 or 1)
+endif
+ifeq ($(WIFI_LOG),1)
+ifneq ($(WIFI_DHCP),1)
+$(error WIFI_LOG=1 requires WIFI_DHCP=1)
+endif
+ifeq ($(wildcard ../config/wifi_log_config.h),)
+$(error WIFI_LOG=1 needs config/wifi_log_config.h; copy the example and set the laptop Wi-Fi IPv4 address)
+endif
+endif
 ifeq ($(WIFI_DHCP),1)
 ifneq ($(WIFI_NETIF),1)
 $(error WIFI_DHCP=1 requires WIFI_NETIF=1)
@@ -183,6 +198,9 @@ endif
 ifeq ($(WIFI_TCPBULK),1)
 WIFI_SUFFIX := _wifi_tcpbulk
 endif
+ifeq ($(WIFI_LOG),1)
+WIFI_SUFFIX := _wifi_log
+endif
 endif
 
 #
@@ -268,7 +286,7 @@ endif
 # before any recipe executes.
 ################################################################################
 
-PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-join$(WIFI_JOIN)-netif$(WIFI_NETIF)-static$(WIFI_STATIC)-dhcp$(WIFI_DHCP)-dns$(WIFI_DNS)-udp$(WIFI_UDP)-tcp$(WIFI_TCP)-bulk$(WIFI_TCPBULK)
+PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-join$(WIFI_JOIN)-netif$(WIFI_NETIF)-static$(WIFI_STATIC)-dhcp$(WIFI_DHCP)-dns$(WIFI_DNS)-log$(WIFI_LOG)-udp$(WIFI_UDP)-tcp$(WIFI_TCP)-bulk$(WIFI_TCPBULK)
 PROFILE_FILE := .build_profile
 
 ifneq ($(strip $(shell cat $(PROFILE_FILE) 2>/dev/null)),$(PROFILE_ID))
@@ -416,6 +434,7 @@ WIFI_INCLUDES := -I"$(WIFIDIR)" \
                  -I"$(PICO_SDK_PATH)/src/boards/include" \
                  -I"$(PICO_SDK_PATH)/src/common/pico_base_headers/include" \
                  -I"$(PICO_SDK_PATH)/src/common/hardware_claim/include" \
+                 -I"$(PICO_SDK_PATH)/src/common/pico_util/include" \
                  -I"$(PICO_SDK_PATH)/src/common/pico_binary_info/include" \
                  -I"$(PICO_SDK_PATH)/src/rp2040/pico_platform/include" \
                  -I"$(PICO_SDK_PATH)/src/rp2040/hardware_regs/include" \
@@ -446,6 +465,7 @@ CFLAGS += -DTM_WIFI_CYW43=1 -DTM_WIFI_JOIN=$(WIFI_JOIN) \
           -DTM_WIFI_STATIC=$(WIFI_STATIC) -DTM_WIFI_DHCP=$(WIFI_DHCP) \
           -DTM_WIFI_DNS=$(WIFI_DNS) -DTM_WIFI_UDP=$(WIFI_UDP) \
           -DTM_WIFI_TCP=$(WIFI_TCP) -DTM_WIFI_TCPBULK=$(WIFI_TCPBULK) \
+          -DTM_WIFI_LOG=$(WIFI_LOG) \
           -DCYW43_ENABLE_BLUETOOTH=0 \
           -DCYW43_USE_OTP_MAC=1 -DPICO_CYW43_LOGGING_ENABLED=0 \
           -DPICO_RP2040=1 -DPICO_32BIT=1 -DPICO_ON_DEVICE=1 -DPICO_BUILD=1 \
