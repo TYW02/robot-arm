@@ -54,9 +54,49 @@
 
 #if TM_WIFI_LOG
 #define CYW43_UTK_LOG_PORT 5005U
+#define CYW43_UTK_LOG_REPORT_US 5000000ULL
+
+/* Set UTK_WIFI_LOG_BROADCAST to 1 in config/wifi_log_config.h to send to the
+ * subnet broadcast address instead of one fixed laptop IP.  The laptop then
+ * receives the logs whatever address DHCP gave it, so no rebuild is needed
+ * when that address changes. */
+#ifndef UTK_WIFI_LOG_BROADCAST
+#define UTK_WIFI_LOG_BROADCAST 0
+#endif
+
+extern uint64_t time_us_64(void);
+/* Plain prototype: tmonitor.h cannot be included next to lwIP (type clash). */
+extern int tm_printf(const unsigned char *format, ...);
 
 /* Log packets are sent only from this CYW43/lwIP owner task. */
 static struct udp_pcb *robot_log_pcb;
+static unsigned int robot_log_sent;
+static unsigned int robot_log_failed;
+static int robot_log_last_err;
+static uint32_t robot_log_reported_ip;
+static uint64_t robot_log_next_report_us;
+
+/* One USB line so a missing log stream can be told apart: no IP yet, wrong
+ * target, or lwIP refusing to send.  Printed when the IP appears and then
+ * every few seconds until the first packet has been sent. */
+static void robot_log_report(struct netif *netif, const ip4_addr_t *target)
+{
+    uint64_t now = time_us_64();
+    uint32_t own = netif_ip4_addr(netif)->addr;
+
+    if(own == robot_log_reported_ip && now < robot_log_next_report_us) return;
+    if(own == robot_log_reported_ip && robot_log_sent != 0
+       && robot_log_failed == 0) return;
+    robot_log_reported_ip = own;
+    robot_log_next_report_us = now + CYW43_UTK_LOG_REPORT_US;
+    tm_printf((const unsigned char*)"[wifi-log] own %d.%d.%d.%d -> %d.%d.%d.%d:%d sent=%u failed=%u last_err=%d\n",
+              ip4_addr1(netif_ip4_addr(netif)), ip4_addr2(netif_ip4_addr(netif)),
+              ip4_addr3(netif_ip4_addr(netif)), ip4_addr4(netif_ip4_addr(netif)),
+              ip4_addr1(target), ip4_addr2(target),
+              ip4_addr3(target), ip4_addr4(target),
+              (int)CYW43_UTK_LOG_PORT, robot_log_sent, robot_log_failed,
+              robot_log_last_err);
+}
 
 static void robot_log_udp_poll(struct netif *netif)
 {
@@ -65,6 +105,7 @@ static void robot_log_udp_poll(struct netif *netif)
     ip4_addr_t target_ipv4;
     ip_addr_t destination;
     struct pbuf *packet;
+    err_t sent;
 
     if(netif == NULL || !netif_is_up(netif) || !netif_is_link_up(netif)
        || netif_ip4_addr(netif)->addr == 0) return;
@@ -72,18 +113,39 @@ static void robot_log_udp_poll(struct netif *netif)
     if(robot_log_pcb == NULL) {
         robot_log_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
         if(robot_log_pcb == NULL) return;
+#if UTK_WIFI_LOG_BROADCAST
+        ip_set_option(robot_log_pcb, SOF_BROADCAST);
+#endif
     }
+
+#if UTK_WIFI_LOG_BROADCAST
+    ip4_addr_set_u32(&target_ipv4,
+                     (netif_ip4_addr(netif)->addr & netif_ip4_netmask(netif)->addr)
+                     | ~netif_ip4_netmask(netif)->addr);
+#else
+    IP4_ADDR(&target_ipv4, UTK_WIFI_LOG_TARGET_A,
+             UTK_WIFI_LOG_TARGET_B, UTK_WIFI_LOG_TARGET_C,
+             UTK_WIFI_LOG_TARGET_D);
+#endif
+    robot_log_report(netif, &target_ipv4);
 
     if(!robot_log_dequeue(bytes, sizeof(bytes), &length)) return;
     packet = pbuf_alloc(PBUF_TRANSPORT, (u16_t)length, PBUF_RAM);
-    if(packet == NULL) return;
+    if(packet == NULL) {
+        robot_log_failed++;
+        robot_log_last_err = ERR_MEM;
+        return;
+    }
     if(pbuf_take(packet, bytes, (u16_t)length) == ERR_OK) {
-        IP4_ADDR(&target_ipv4, UTK_WIFI_LOG_TARGET_A,
-                 UTK_WIFI_LOG_TARGET_B, UTK_WIFI_LOG_TARGET_C,
-                 UTK_WIFI_LOG_TARGET_D);
         ip_addr_copy_from_ip4(destination, target_ipv4);
-        (void)udp_sendto_if(robot_log_pcb, packet, &destination,
-                            (u16_t)CYW43_UTK_LOG_PORT, netif);
+        sent = udp_sendto_if(robot_log_pcb, packet, &destination,
+                             (u16_t)CYW43_UTK_LOG_PORT, netif);
+        if(sent == ERR_OK) {
+            robot_log_sent++;
+        } else {
+            robot_log_failed++;
+            robot_log_last_err = (int)sent;
+        }
     }
     pbuf_free(packet);
 }

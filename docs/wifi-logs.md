@@ -52,3 +52,39 @@ the same Wi-Fi without a USB cable to the Pico.
 The transport is UDP, so it does not need a broker and a log line may be lost
 if Wi-Fi is disconnected or the small queue fills. USB CDC output remains
 available when the Pico is connected to the laptop.
+
+## macOS / Linux steps
+
+```bash
+cd third_party/mtk3smp-rp2040/config
+[ -f wifi_credentials.h ] || cp wifi_credentials.example.h wifi_credentials.h
+[ -f wifi_log_config.h ]  || cp wifi_log_config.example.h  wifi_log_config.h
+# edit wifi_credentials.h (SSID, password, UTK_WIFI_CREDENTIALS_SET 1)
+
+cd ../build_make
+make SMP=1 CONSOLE=usb_cdc WIFI=cyw43 WIFI_JOIN=1 WIFI_NETIF=1 WIFI_DHCP=1 \
+     WIFI_LOG=1 PICO_SDK_PATH=$HOME/.pico-sdk/sdk/2.3.1 -j8
+
+python3 ../../../tools/wifi_log_receiver.py     # on the laptop, before powering the Pico
+```
+
+Find the laptop address with `ipconfig getifaddr en0` (macOS) or `ipconfig` (Windows).
+
+## No log lines arriving? Read the USB status line
+
+With the Pico on USB, the console prints a line like:
+
+```
+[wifi-log] own 192.168.1.42 -> 192.168.1.255:5005 sent=37 failed=0 last_err=0
+```
+
+- No `[wifi-log]` line at all: the Pico has not joined Wi-Fi or has no IP. Check SSID and password, and use a 2.4 GHz network.
+- `sent` rises but nothing arrives: the target is wrong or the laptop firewall or network is blocking UDP 5005. Allow Python through the firewall; some hotspots and campus networks block device-to-device traffic.
+- `failed` rises: `last_err` is the lwIP error code (-1 = out of memory).
+
+## Broadcast mode (no fixed laptop IP)
+
+Setting `UTK_WIFI_LOG_BROADCAST 1` in `wifi_log_config.h` makes the Pico send to the
+subnet broadcast address (shown as `x.y.z.255` in the status line), so the logs reach the
+laptop whatever address DHCP gave it. The example config enables it. Set it to 0 to send
+to the fixed `UTK_WIFI_LOG_TARGET_*` address instead.
