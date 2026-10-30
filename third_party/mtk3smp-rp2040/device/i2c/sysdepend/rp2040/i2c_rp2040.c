@@ -133,8 +133,11 @@ LOCAL void i2c_inthdr( UINT intno )
 	case I2C_STS_RECV:
 		if(i2c_sts & I2C_INT_RX_FULL) {
 			*(p_cb->rbuf)++ = in_w(I2C_DATA_CMD(unit)) & I2C_DATA_CMD_DAT;
-			if(--(p_cb->rdat_num)) {
+			if (--(p_cb->rdat_num)) {
 				cmd = I2C_DATA_CMD_CMD_READ;
+				if (p_cb->rdat_num == 1) {
+					cmd |= I2C_DATA_CMD_STOP;
+				}
 				out_w(I2C_DATA_CMD(unit), cmd);
 			} else {	// Last data
 				clr_w(I2C_INTR_MASK(unit), I2C_INT_RX_FULL);
@@ -161,11 +164,16 @@ LOCAL void i2c_inthdr( UINT intno )
 	(void)in_w(I2C_CLR_INTR(unit));	// Clear all Interrupt Registers
 	ClearInt(intno);		// Clear interrupt
 
-	if(wup) {
+	if (wup) {
 		out_w(I2C_INTR_MASK(unit), 0);
+	}
+
+	I2C_UNLOCK(unit, intsts);
+
+	/* Wake the task after restoring the interrupt state. */
+	if (wup) {
 		(void)tk_set_flg(p_cb->done_flgid, 1);
 	}
-	I2C_UNLOCK(unit, intsts);
 }
 /*----------------------------------------------------------------------
  * Execution of communication
@@ -331,10 +339,10 @@ EXPORT ER dev_i2c_llinit( T_I2C_DCB *p_dcb)
 #endif
 
 #if DEVCNF_I2C_SETPINFUNC
-		out_w(GPIO_CTRL(8), GPIO_CTRL_FUNCSEL_I2C);
-		out_w(GPIO(8), GPIO_IE | GPIO_DRIVE_4MA | GPIO_PUE | GPIO_SHEMITT);
-		out_w(GPIO_CTRL(9), GPIO_CTRL_FUNCSEL_I2C);
-		out_w(GPIO(9), GPIO_IE | GPIO_DRIVE_4MA | GPIO_PUE | GPIO_SHEMITT);
+		out_w(GPIO_CTRL(16), GPIO_CTRL_FUNCSEL_I2C);
+		out_w(GPIO(16), GPIO_IE | GPIO_DRIVE_4MA | GPIO_PUE | GPIO_SHEMITT);
+		out_w(GPIO_CTRL(17), GPIO_CTRL_FUNCSEL_I2C);
+		out_w(GPIO(17), GPIO_IE | GPIO_DRIVE_4MA | GPIO_PUE | GPIO_SHEMITT);
 #endif
 		break;
 	case DEV_I2C_1:
@@ -346,10 +354,10 @@ EXPORT ER dev_i2c_llinit( T_I2C_DCB *p_dcb)
 #endif
 
 #if DEVCNF_I2C_SETPINFUNC
-		out_w(GPIO_CTRL(6), GPIO_CTRL_FUNCSEL_I2C);
-		out_w(GPIO(6), GPIO_IE | GPIO_DRIVE_4MA | GPIO_PUE | GPIO_SHEMITT);
-		out_w(GPIO_CTRL(7), GPIO_CTRL_FUNCSEL_I2C);
-		out_w(GPIO(7), GPIO_IE | GPIO_DRIVE_4MA | GPIO_PUE | GPIO_SHEMITT);
+		out_w(GPIO_CTRL(2), GPIO_CTRL_FUNCSEL_I2C);
+		out_w(GPIO(2), GPIO_IE | GPIO_DRIVE_4MA | GPIO_PUE | GPIO_SHEMITT);
+		out_w(GPIO_CTRL(3), GPIO_CTRL_FUNCSEL_I2C);
+		out_w(GPIO(3), GPIO_IE | GPIO_DRIVE_4MA | GPIO_PUE | GPIO_SHEMITT);
 		break;
 #endif
 	default:

@@ -1,4 +1,6 @@
 #include <tk/tkernel.h>
+#include "../third_party/mtk3smp-rp2040/device/include/dev_i2c.h"
+#include "../components/imu/imu_heading.h"
 #include <tm/tmonitor.h>
 #include <tk/smp.h>
 #include "../components/drive/motor.h"
@@ -919,6 +921,8 @@ LOCAL void task_state_machine(INT stacd, void *exinf)
 // ======================================================
 EXPORT INT usermain(void)
 {
+    tk_dly_tsk(5000);
+    tm_printf((UB*)"[IMU TEST] reached usermain\n");
     robot_logf((UB*)"Pico W vision app on micro T-Kernel SMP starting (reset: %s)...\n",
               reset_cause());
 
@@ -930,6 +934,47 @@ EXPORT INT usermain(void)
         return 0;
     }
     robot_logf((UB*)"[init] gripper PWM ready; signal idle until an object marker is detected\n");
+    // wait for the IMU to be detected before starting the mission
+    ER imu_er = imu_heading_start();
+
+    for (;;) {
+        imu_heading_reading_t s = {0};
+
+        if (imu_er < E_OK) {
+            robot_logf((UB*)
+                "[IMU] task start failed: %d; mission held\n",
+                imu_er);
+        } else {
+            imu_heading_read(&s);
+
+            if (s.fault < E_OK) {
+                robot_logf((UB*)
+                    "[IMU] FAULT=%d; mission held; reset to retry\n",
+                    s.fault);
+            } else if (!s.ready) {
+                robot_logf((UB*)
+                    "[IMU] WAIT; M_ERR=%u REJ=%u; mission held\n",
+                    s.mag_errors, s.rejected);
+            } else {
+                robot_logf((UB*)
+                    "[IMU] %s H_cd=%d REL_cd=%d GYRO_cd=%d MAG_cd=%d "
+                    "GZ_cdps=%d FIELD_milli=%d G_Hz10=%u M_Hz10=%u "
+                    "M_ERR=%u REJ=%u OVR=%u LATE=%u; mission held\n",
+                    s.valid
+                        ? (s.mag_valid ? "FUSED" : "GYRO_ONLY")
+                        : "STALE",
+                    (INT)(s.heading_deg * 100.0f),
+                    (INT)(s.relative_deg * 100.0f),
+                    (INT)(s.gyro_relative_deg * 100.0f),
+                    (INT)(s.magnetic_deg * 100.0f),
+                    (INT)(s.gyro_z_dps * 100.0f),
+                    (INT)(s.field_xy * 1000.0f),
+                    s.gyro_hz_x10, s.mag_hz_x10,
+                    s.mag_errors, s.rejected, s.overruns, s.late);
+            }
+        }
+        tk_dly_tsk(250);
+    }
 
     // CRITICAL FIX: TD_READ | TD_WRITE is required, TD_UPDATE blocks UART
     uart_device_id = tk_opn_dev((const UB*)"sera", TD_READ | TD_WRITE);

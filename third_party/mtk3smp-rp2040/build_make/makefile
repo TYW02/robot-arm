@@ -72,7 +72,7 @@ all: $(EXE_FILE).elf
 
 $(EXE_FILE).elf: $(OBJS) $(E2U)
 	@echo 'Linker: $@'
-	$(LINK)  $(LFLAGS) -T $(LNKFILE) -Wl,-Map,"$(EXE_FILE).map" -o "$(EXE_FILE).elf" $(OBJS)
+	$(LINK) $(LFLAGS) --specs=nosys.specs -Wl,--defsym=end=__end -T $(LNKFILE) -Wl,-Map,"$(EXE_FILE).map" -o "$(EXE_FILE).elf" $(OBJS) -lm
 	@echo 'Finished building target: $@'
 ifneq ($(SIZE),)
 	$(SIZE) $(EXE_FILE).elf
