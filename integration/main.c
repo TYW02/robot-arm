@@ -5,6 +5,7 @@
 #include "../components/imu/imu_heading.h"
 #include "../components/drive/motor.h"
 #include "../components/drive/claw.h"
+#include "../components/drive/drive_turn.h"
 
 #include <stdarg.h>
 
@@ -22,12 +23,15 @@
 #define DIRECTION_STANDOFF_MM        200
 
 #define DIRECTION_ALIGN_TOLERANCE_PX 74
-#define DIRECTION_ALIGN_PULSE_MS     70
-#define DIRECTION_SEARCH_PULSE_MS    70
+#define DIRECTION_ALIGN_STEP_DEG     5.0f
+#define DIRECTION_SEARCH_STEP_DEG    8.0f
+#define OBJECT_SCAN_STEP_DEG         10.0f
+
+#define GYRO_TURN_TEST_ONLY          0
 
 #define REVERSE_AFTER_RELEASE_MS    300
 #define OBJECT_SCAN_TURN_SPEED      18
-#define OBJECT_SCAN_TURN_PULSE_MS   150
+
 
 #define CAR_DRIVE_SPEED             25
 #define CAR_TURN_SPEED              20
@@ -64,7 +68,14 @@ typedef struct {
     INT right;
     INT ms;
     BOOL stop;
+    BOOL turn;
+    float degrees;
 } DriveCommand;
+
+typedef struct {
+    ER error;
+    float actual_deg;
+} DriveTurnResult;
 
 typedef struct {
     int id;
@@ -104,6 +115,7 @@ LOCAL ID uart_device_id;
 LOCAL ID command_mbf_id;
 LOCAL ID mtx_id;
 LOCAL ID drive_mbf_id;
+LOCAL ID turn_result_mbf_id;
 
 LOCAL UW command_mbf_buffer[
     (4 * sizeof(ModeCommand)) / sizeof(UW) + 16
@@ -195,6 +207,17 @@ LOCAL T_CMBF drive_cmbf = {
     .maxmsz = sizeof(DriveCommand),
     .mbfatr = TA_TFIFO,
     .bufptr = drive_mbf_buffer
+};
+
+LOCAL UW turn_result_buffer[
+    (sizeof(DriveTurnResult) + sizeof(UW) - 1U) / sizeof(UW) + 2U
+];
+
+LOCAL T_CMBF turn_result_cmbf = {
+    .bufsz = sizeof(turn_result_buffer),
+    .maxmsz = sizeof(DriveTurnResult),
+    .mbfatr = TA_TFIFO,
+    .bufptr = turn_result_buffer
 };
 
 /* ---------- Existing log queue ---------- */
@@ -1286,6 +1309,31 @@ LOCAL void task_drive(INT stacd, void *exinf)
             current_right = 0;
             continue;
         }
+        if (command.turn) {
+            DriveTurnResult reply = {0};
+
+            reply.error = drive_turn_run(
+                command.degrees,
+                mission_motion_allowed,
+                &reply.actual_deg
+            );
+
+            current_left = current_right = 0;
+
+            if (reply.error < E_OK)
+                mission_latch_stop("Gyro turn failed");
+
+            if (tk_snd_mbf(
+                    turn_result_mbf_id,
+                    &reply,
+                    sizeof(reply),
+                    TMO_POL) < E_OK) {
+                mission_latch_stop(
+                    "Could not report gyro turn completion");
+            }
+
+            continue;
+        }
 
         if (command.stop) {
             motor_brake();
@@ -1374,6 +1422,61 @@ static void drive_stop(void)
     }
 
     (void)tk_dly_tsk(20);
+}
+
+static BOOL drive_turn_degrees(float degrees)
+{
+    mission_checkpoint();
+
+    DriveCommand command = {0};
+    command.turn = TRUE;
+    command.degrees = degrees;
+
+    DriveTurnResult reply = {0};
+    UW started, now;
+
+    robot_logf((UB*)
+        "[turn] request_cd=%d (right positive)\n",
+        (INT)(degrees * 100.0f));
+
+    if (!mission_now_ms(&started) ||
+        tk_snd_mbf(
+            drive_mbf_id, &command,
+            sizeof(command), 1000) < E_OK) {
+        mission_latch_stop("Could not queue gyro turn");
+        mission_checkpoint();
+        return FALSE;
+    }
+
+    for (;;) {
+        INT received = tk_rcv_mbf(
+            turn_result_mbf_id, &reply, 100);
+
+        if (received == (INT)sizeof(reply))
+            break;
+
+        if (received != E_TMOUT ||
+            !mission_motion_allowed() ||
+            !mission_now_ms(&now) ||
+            (UW)(now - started) >= TURN_TIMEOUT_MS + 2000U) {
+            mission_latch_stop(
+                "Gyro turn reply failed or timed out");
+            mission_checkpoint();
+            return FALSE;
+        }
+    }
+
+    robot_logf((UB*)"[turn] actual_cd=%d error=%d\n",
+               (INT)(reply.actual_deg * 100.0f),
+               reply.error);
+
+    if (reply.error < E_OK) {
+        mission_latch_stop("Gyro turn failed");
+        mission_checkpoint();
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 /* ---------- Camera scans and target selection ---------- */
@@ -1504,61 +1607,28 @@ static INT clamp_int(
 }
 
 static BOOL search_direction_marker(
-    INT marker_id,
-    marker_reading_t *target
-)
+    INT marker_id, marker_reading_t *target)
 {
-    mission_checkpoint();
+    robot_logf((UB*)
+        "[mission] searching for direction marker\n");
 
-    robot_logf(
-        (UB *)"[mission] direction marker lost; "
-               "searching with a small left/right sweep\n"
-    );
+    const float sweep[2] = {
+        -DIRECTION_SEARCH_STEP_DEG,
+         DIRECTION_SEARCH_STEP_DEG * 2.0f
+    };
 
-    drive_pulse(
-        -CAR_TURN_SPEED,
-        CAR_TURN_SPEED,
-        DIRECTION_SEARCH_PULSE_MS
-    );
+    for (INT i = 0; i < 2; ++i) {
+        if (!drive_turn_degrees(sweep[i]))
+            return FALSE;
 
-    request_marker_scan(
-        DIRECTION_SCAN_COMMAND,
-        SCAN_WINDOW_MS
-    );
+        request_marker_scan(
+            DIRECTION_SCAN_COMMAND, SCAN_WINDOW_MS);
 
-    if (read_direction(marker_id, target)) {
-        robot_logf(
-            (UB *)"[mission] direction marker "
-                   "reacquired after left turn\n"
-        );
-        return TRUE;
+        if (read_direction(marker_id, target))
+            return TRUE;
     }
 
-    drive_pulse(
-        CAR_TURN_SPEED,
-        -CAR_TURN_SPEED,
-        DIRECTION_SEARCH_PULSE_MS * 2
-    );
-
-    request_marker_scan(
-        DIRECTION_SCAN_COMMAND,
-        SCAN_WINDOW_MS
-    );
-
-    if (read_direction(marker_id, target)) {
-        robot_logf(
-            (UB *)"[mission] direction marker "
-                   "reacquired after right turn\n"
-        );
-        return TRUE;
-    }
-
-    drive_pulse(
-        -CAR_TURN_SPEED,
-        CAR_TURN_SPEED,
-        DIRECTION_SEARCH_PULSE_MS
-    );
-
+    (void)drive_turn_degrees(-DIRECTION_SEARCH_STEP_DEG);
     drive_stop();
     return FALSE;
 }
@@ -1603,11 +1673,8 @@ static BOOL approach_marker(
                            "slowly rotating right to scan\n"
                 );
 
-                drive_pulse(
-                    OBJECT_SCAN_TURN_SPEED,
-                    -OBJECT_SCAN_TURN_SPEED,
-                    OBJECT_SCAN_TURN_PULSE_MS
-                );
+                if (!drive_turn_degrees(OBJECT_SCAN_STEP_DEG))
+                    return FALSE;
 
                 drive_stop();
             } else {
@@ -1673,7 +1740,15 @@ static BOOL approach_marker(
                 claw_get_angle()
             );
 
-            (void)tk_dly_tsk(400);
+            if (!mission_checked_delay(400U))
+                mission_checkpoint();
+
+            claw_release();
+
+            robot_logf((UB*)
+                "[gripper] open complete; PWM signal released\n");
+
+            mission_checkpoint();
 
             /* Start a new scan after the claw has opened. */
             continue;
@@ -1786,77 +1861,36 @@ static BOOL align_direction_marker(INT marker_id)
         mission_checkpoint();
 
         request_marker_scan(
-            DIRECTION_SCAN_COMMAND,
-            SCAN_WINDOW_MS
-        );
+            DIRECTION_SCAN_COMMAND, SCAN_WINDOW_MS);
 
         marker_reading_t target = {0};
 
-        if (!read_direction(marker_id, &target)) {
-            if (!search_direction_marker(
-                    marker_id,
-                    &target)) {
-
-                drive_stop();
-
-                robot_logf(
-                    (UB *)"[mission] direction marker "
-                           "not found during alignment\n"
-                );
-                return FALSE;
-            }
+        if (!read_direction(marker_id, &target) &&
+            !search_direction_marker(marker_id, &target)) {
+            drive_stop();
+            return FALSE;
         }
 
         INT error_x = target.x - CAMERA_CENTER_X;
 
         if (error_x >= -DIRECTION_ALIGN_TOLERANCE_PX &&
             error_x <= DIRECTION_ALIGN_TOLERANCE_PX) {
-
             drive_stop();
-
-            robot_logf(
-                (UB *)"[mission] direction marker "
-                       "straight ahead, x:%d\n",
-                target.x
-            );
-
             return TRUE;
         }
 
-        if (error_x < 0) {
-            robot_logf(
-                (UB *)"[mission] marker left, x:%d; "
-                       "turning left\n",
-                target.x
-            );
+        robot_logf((UB*)
+            "[mission] alignment x:%d\n", target.x);
 
-            drive_pulse(
-                -CAR_TURN_SPEED,
-                CAR_TURN_SPEED,
-                DIRECTION_ALIGN_PULSE_MS
-            );
-        } else {
-            robot_logf(
-                (UB *)"[mission] marker right, x:%d; "
-                       "turning right\n",
-                target.x
-            );
+        float degrees = error_x < 0
+            ? -DIRECTION_ALIGN_STEP_DEG
+            : DIRECTION_ALIGN_STEP_DEG;
 
-            drive_pulse(
-                CAR_TURN_SPEED,
-                -CAR_TURN_SPEED,
-                DIRECTION_ALIGN_PULSE_MS
-            );
-        }
+        if (!drive_turn_degrees(degrees))
+            return FALSE;
     }
 
     drive_stop();
-
-    robot_logf(
-        (UB *)"[mission] could not align with "
-               "direction marker; stopping\n"
-    );
-
     return FALSE;
 }
 
@@ -2155,10 +2189,12 @@ EXPORT INT usermain(void)
     command_mbf_id = tk_cre_mbf(&cmbf);
     mtx_id = tk_cre_mtx(&cmtx);
     drive_mbf_id = tk_cre_mbf(&drive_cmbf);
+    turn_result_mbf_id = tk_cre_mbf(&turn_result_cmbf);
 
     if (command_mbf_id <= E_OK ||
         mtx_id <= E_OK ||
-        drive_mbf_id <= E_OK) {
+        drive_mbf_id <= E_OK ||
+        turn_result_mbf_id <= E_OK) {
 
         robot_logf(
             (UB *)"[init] kernel object creation failed: "
@@ -2195,6 +2231,21 @@ EXPORT INT usermain(void)
 
     if (!mission_motion_allowed())
         mission_park();
+    
+    #if GYRO_TURN_TEST_ONLY
+        robot_logf((UB*)
+            "[test] right 15 degrees, then left 15; mission held\n");
+
+        (void)drive_turn_degrees(15.0f);
+
+        if (!mission_checked_delay(1000U))
+            mission_checkpoint();
+
+        (void)drive_turn_degrees(-15.0f);
+
+        mission_latch_stop("Gyro turn test complete");
+        mission_checkpoint();
+    #endif
 
     robot_logf(
         (UB *)"[mission] ENABLED: IMU ready; "
