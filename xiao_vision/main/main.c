@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 
 // ======================================================
 // UART (to Pico W)
@@ -22,8 +23,9 @@
 // ======================================================
 typedef enum { MODE_IDLE, MODE_SCAN, MODE_COLOR } vision_mode_t;
 
-// Start in COLOR mode by default
+// Start in marker scan mode; the Pico selects the physical marker size.
 static volatile vision_mode_t g_mode = MODE_SCAN; 
+static volatile int g_marker_size_mm = 80;
 
 static const char *TAG = "VISION";
 
@@ -53,7 +55,8 @@ static const char *TAG = "VISION";
 // ======================================================
 typedef enum { COLOR_NONE = 0, COLOR_RED, COLOR_GREEN, COLOR_BLUE } color_t;
 
-#define STRIDE 4   
+#define STRIDE 4
+#define MIN_COLOR_PERCENT 2
 
 static void rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b,
                        uint8_t *h, uint8_t *s, uint8_t *v)
@@ -82,11 +85,11 @@ static void rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b,
 
 static color_t classify_hsv(uint8_t h, uint8_t s, uint8_t v)
 {
-    if (v < 30 || s < 60) return COLOR_NONE;
+    if (v < 35 || s < 50) return COLOR_NONE;
 
-    if ((h <= 15 || h >= 240) && s > 70) return COLOR_RED;
-    if (h >= 60 && h <= 90 && s > 120)   return COLOR_GREEN;
-    if (h >= 120 && h <= 180 && s > 60)  return COLOR_BLUE;
+    if (h <= 20 || h >= 235) return COLOR_RED;
+    if (h >= 50 && h <= 110) return COLOR_GREEN;
+    if (h >= 115 && h <= 195) return COLOR_BLUE;
 
     return COLOR_NONE;
 }
@@ -148,7 +151,7 @@ static detection_t detect_dominant_color(camera_fb_t *fb)
         }
     }
 
-    if (best == COLOR_NONE || (best_count * 100 / total) < 5) {
+    if (best == COLOR_NONE || (best_count * 100 / total) < MIN_COLOR_PERCENT) {
         return result;   // no color wins
     }
 
@@ -223,16 +226,12 @@ static esp_err_t init_camera(void)
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-            // AWB/AEC enabled by default; just let it run for a second
-        vTaskDelay(pdMS_TO_TICKS(1500));
-
-        // Then lock the gains at whatever AWB decided
-        s->set_whitebal(s, 0);
-        s->set_awb_gain(s, 0);
-        s->set_exposure_ctrl(s, 0);
-        s->set_gain_ctrl(s, 0);
-        // Optional: set a manual white balance for your lighting
-        // s->set_wb_mode(s, 1);    // 0=auto, 1=sunny, 2=cloudy, 3=office, 4=home
+        // Keep exposure and white balance automatic so color classification
+        // remains usable when lighting changes.
+        s->set_whitebal(s, 1);
+        s->set_awb_gain(s, 1);
+        s->set_exposure_ctrl(s, 1);
+        s->set_gain_ctrl(s, 1);
     }
     return err;
 }
@@ -299,11 +298,16 @@ static void uart_rx_task(void *arg)
             else if (state == 3 && byte == '\n') {
                 if (last_cmd == 'S') {
                     g_mode = MODE_SCAN;
-                    ESP_LOGI(TAG, "Switched to SCAN mode");
+                    ESP_LOGI(TAG, "Switched to SCAN mode (marker size %d mm)", g_marker_size_mm);
                 }
                 else if (last_cmd == 'C') {
                     g_mode = MODE_COLOR;
                     ESP_LOGI(TAG, "Switched to COLOR mode");
+                }
+                else if (last_cmd == '3' || last_cmd == '8') {
+                    g_marker_size_mm = (last_cmd == '3') ? 30 : 80;
+                    g_mode = MODE_SCAN;
+                    ESP_LOGI(TAG, "Switched to SCAN mode (marker size %d mm)", g_marker_size_mm);
                 }
                 else if (last_cmd == 'I') g_mode = MODE_IDLE;
                 state = 0;
@@ -317,6 +321,7 @@ static void uart_rx_task(void *arg)
 
 // Helper to calculate XOR checksum and append it
 static void send_with_checksum(const char* format, ...) {
+    static bool tx_debug_reported = false;
     char tx_buffer[64];
     va_list args;
     va_start(args, format);
@@ -329,8 +334,14 @@ static void send_with_checksum(const char* format, ...) {
         checksum ^= (uint8_t)tx_buffer[i];
     }
 
-    len += snprintf(tx_buffer + len, sizeof(tx_buffer) - len, "*%02X\n", checksum);
-    uart_write_bytes(VISION_UART_NUM, tx_buffer, len);
+    int frame_len = len + snprintf(tx_buffer + len, sizeof(tx_buffer) - len,
+                                   "*%02X\n", checksum);
+    int written = uart_write_bytes(VISION_UART_NUM, tx_buffer, frame_len);
+    if (!tx_debug_reported) {
+        ESP_LOGI(TAG, "UART TX first frame: wrote %d/%d bytes", written, frame_len);
+        ESP_LOG_BUFFER_HEXDUMP(TAG, tx_buffer, frame_len, ESP_LOG_INFO);
+        tx_debug_reported = true;
+    }
 }
 
 void app_main(void)
@@ -350,6 +361,7 @@ void app_main(void)
     int16_t last_sent_x = -999;
     int16_t last_sent_y = -999;
     uint32_t last_send_ms = 0;
+    uint32_t last_aruco_status_ms = 0;
 
     while (1) {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -362,13 +374,29 @@ void app_main(void)
 
         // Branch based on mode (MODE_SCAN / MODE_COLOR)
         if (g_mode == MODE_SCAN) {
-            // Aruco Scanning
-            aruco_result_t res = aruco_detect_frame(fb);
-
-            if (res.detected) {
-                // Send using the checksum helper (no uart_write_bytes needed)
-                send_with_checksum("A,%d,%d,%d,%.1f,%.1f", 
-                                res.marker_id, (int)res.cx, (int)res.cy, res.width_px, res.distance_mm);
+            // Report every visible marker in this frame, not just the first.
+            aruco_result_t results[16];
+            int count = aruco_detect_frame(fb, (float)g_marker_size_mm,
+                                           results, 16);
+            uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if ((now_ms - last_aruco_status_ms) >= 1000) {
+                if (count > 0) {
+                    ESP_LOGI(TAG, "ArUco scan: %d marker(s), first ID %d, size %d mm",
+                             count, results[0].marker_id, g_marker_size_mm);
+                } else {
+                    ESP_LOGW(TAG, "ArUco scan: no markers; frame %ux%u format %d, size %d mm",
+                             (unsigned)fb->width, (unsigned)fb->height,
+                             (int)fb->format, g_marker_size_mm);
+                }
+                last_aruco_status_ms = now_ms;
+            }
+            for (int i = 0; i < count; ++i) {
+                if (results[i].detected) {
+                    send_with_checksum("A,%d,%d,%d,%.1f,%.1f",
+                        results[i].marker_id, (int)results[i].cx,
+                        (int)results[i].cy, results[i].width_px,
+                        results[i].distance_mm);
+                }
             }
         } else if (g_mode == MODE_COLOR) {
             // COLOR DETECTION
@@ -394,11 +422,11 @@ void app_main(void)
                                 : "N";
 
                 if (consensus.color == COLOR_NONE || consensus.x < 0) {
-                    // Send using the checksum helper
                     send_with_checksum("C,N");
+                    ESP_LOGI(TAG, "No recognized color in the camera frame");
                 } else {
-                    // Send using the checksum helper
                     send_with_checksum("C,%s,%d,%d", name, consensus.x, consensus.y);
+                    ESP_LOGI(TAG, "Color %s at (%d,%d)", name, consensus.x, consensus.y);
                 }
                 
                 last_sent_color = consensus.color;
