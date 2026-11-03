@@ -476,15 +476,9 @@ static void mission_latch_stop(const char *reason)
     }
 }
 
-static BOOL mission_imu_healthy(
-    const imu_heading_reading_t *s
-)
+static BOOL mission_imu_healthy(const imu_heading_reading_t *s)
 {
-    return
-        s->fault == E_OK &&
-        s->ready &&
-        s->valid &&
-        s->mag_valid;
+    return s->fault == E_OK && s->ready && s->valid;
 }
 
 static BOOL mission_motion_allowed(void)
@@ -497,9 +491,7 @@ static BOOL mission_motion_allowed(void)
     imu_heading_read(&s);
 
     if (!mission_imu_healthy(&s)) {
-        mission_latch_stop(
-            "IMU fault, stale gyro data or lost magnetic heading"
-        );
+        mission_latch_stop("IMU fault or stale gyro data");
         return FALSE;
     }
 
@@ -576,36 +568,16 @@ static void print_imu_reading(
     }
 
     if (!s->ready) {
-        robot_logf(
-            (UB *)"[IMU] WAIT; M_ERR=%u REJ=%u; %s\n",
-            s->mag_errors,
-            s->rejected,
-            mission_status
-        );
+        robot_logf((UB *)"[IMU] WAIT; %s\n", mission_status);
         return;
     }
 
-    const char *mode = s->valid
-        ? (s->mag_valid ? "FUSED" : "GYRO_ONLY")
-        : "STALE";
-
     robot_logf(
-        (UB *)"[IMU] %s H_cd=%d REL_cd=%d GYRO_cd=%d "
-               "MAG_cd=%d GZ_cdps=%d FIELD_milli=%d "
-               "G_Hz10=%u M_Hz10=%u M_ERR=%u REJ=%u "
-               "OVR=%u LATE=%u; %s\n",
-        mode,
-        (INT)(s->heading_deg * 100.0f),
+        (UB *)"[IMU] %s REL_cd=%d GZ_cdps=%d G_Hz10=%u LATE=%u; %s\n",
+        s->valid ? "GYRO_ONLY" : "STALE",
         (INT)(s->relative_deg * 100.0f),
-        (INT)(s->gyro_relative_deg * 100.0f),
-        (INT)(s->magnetic_deg * 100.0f),
         (INT)(s->gyro_z_dps * 100.0f),
-        (INT)(s->field_xy * 1000.0f),
         s->gyro_hz_x10,
-        s->mag_hz_x10,
-        s->mag_errors,
-        s->rejected,
-        s->overruns,
         s->late,
         mission_status
     );
@@ -646,8 +618,6 @@ static BOOL wait_for_imu_startup(void)
             mission_imu_healthy(&s) &&
             s.gyro_hz_x10 >= 900U &&
             s.gyro_hz_x10 <= 1100U &&
-            s.mag_hz_x10 >= 200U &&
-            s.mag_hz_x10 <= 300U &&
             s.gyro_z_dps >= -0.50f &&
             s.gyro_z_dps <= 0.50f;
 
@@ -1600,7 +1570,9 @@ static BOOL approach_marker(
     INT *reached_marker_id
 )
 {
+    const BOOL object_pickup = marker_id == 0;
     INT lost_scans = 0;
+    INT opening_candidate_id = 0;
 
     for (INT step = 0;
          step < MAX_APPROACH_STEPS;
@@ -1611,20 +1583,21 @@ static BOOL approach_marker(
         marker_reading_t target = {0};
 
         request_marker_scan(
-            marker_id == 0
+            object_pickup
                 ? OBJECT_SCAN_COMMAND
                 : DIRECTION_SCAN_COMMAND,
             SCAN_WINDOW_MS
         );
 
-        BOOL found = marker_id == 0
+        BOOL found = object_pickup
             ? nearest_object(&target)
             : read_direction(marker_id, &target);
 
         if (!found) {
             drive_stop();
+            opening_candidate_id = 0;
 
-            if (marker_id == 0) {
+            if (object_pickup) {
                 robot_logf(
                     (UB *)"[mission] no object visible; "
                            "slowly rotating right to scan\n"
@@ -1645,9 +1618,7 @@ static BOOL approach_marker(
             }
 
             if (!found) {
-                if (++lost_scans >=
-                    MAX_LOST_SCAN_ATTEMPTS) {
-
+                if (++lost_scans >= MAX_LOST_SCAN_ATTEMPTS) {
                     robot_logf(
                         (UB *)"[mission] target lost; "
                                "stopping approach\n"
@@ -1665,28 +1636,50 @@ static BOOL approach_marker(
 
         lost_scans = 0;
 
-        if (marker_id == 0 &&
+        if (object_pickup && !(target.distance > 0.0f)) {
+            drive_stop();
+            opening_candidate_id = 0;
+
+            robot_logf(
+                (UB *)"[mission] invalid object distance; rescanning\n"
+            );
+            continue;
+        }
+
+        if (object_pickup &&
             gripper_opened != NULL &&
             !*gripper_opened) {
 
+            if (opening_candidate_id != target.id) {
+                opening_candidate_id = target.id;
+                drive_stop();
+
+                robot_logf(
+                    (UB *)"[gripper] confirming object ID:%d "
+                           "before opening\n",
+                    target.id
+                );
+                continue;
+            }
+
             mission_checkpoint();
             claw_open();
-
             *gripper_opened = TRUE;
 
             robot_logf(
-                (UB *)"[gripper] object ID:%d seen; "
+                (UB *)"[gripper] object ID:%d confirmed; "
                        "opening at %d degrees\n",
                 target.id,
                 claw_get_angle()
             );
 
             (void)tk_dly_tsk(400);
-            mission_checkpoint();
+
+            /* Start a new scan after the claw has opened. */
+            continue;
         }
 
-        INT distance_mm =
-            (INT)(target.distance + 0.5f);
+        INT distance_mm = (INT)(target.distance + 0.5f);
 
         robot_logf(
             (UB *)"[mission] target ID:%d at %d mm "
@@ -1697,14 +1690,42 @@ static BOOL approach_marker(
         );
 
         if (distance_mm <= standoff_mm) {
+            drive_stop();
+            mission_checkpoint();
+
+            if (object_pickup) {
+                marker_reading_t confirmation = {0};
+
+                robot_logf(
+                    (UB *)"[gripper] confirming object ID:%d "
+                           "within %d mm before closing\n",
+                    target.id,
+                    standoff_mm
+                );
+
+                request_marker_scan(
+                    OBJECT_SCAN_COMMAND,
+                    SCAN_WINDOW_MS
+                );
+
+                if (!nearest_object(&confirmation) ||
+                    confirmation.id != target.id ||
+                    !(confirmation.distance > 0.0f) ||
+                    (INT)(confirmation.distance + 0.5f) > standoff_mm) {
+
+                    robot_logf(
+                        (UB *)"[gripper] pickup not confirmed; "
+                               "holding position and rescanning\n"
+                    );
+                    continue;
+                }
+            }
+
             robot_logf(
                 (UB *)"[mission] stop limit reached "
                        "for target ID:%d\n",
                 target.id
             );
-
-            drive_stop();
-            mission_checkpoint();
 
             if (reached_marker_id != NULL)
                 *reached_marker_id = target.id;
@@ -1716,15 +1737,14 @@ static BOOL approach_marker(
         INT left;
         INT right;
 
-        if (marker_id != 0 &&
+        if (!object_pickup &&
             error_x >= -DIRECTION_ALIGN_TOLERANCE_PX &&
             error_x <= DIRECTION_ALIGN_TOLERANCE_PX) {
 
             left = CAR_DRIVE_SPEED;
             right = CAR_DRIVE_SPEED;
         } else {
-            INT correction =
-                clamp_int(error_x / 8, -12, 12);
+            INT correction = clamp_int(error_x / 8, -12, 12);
 
             left = clamp_int(
                 CAR_DRIVE_SPEED + correction,
@@ -1889,18 +1909,11 @@ LOCAL void task_state_machine(INT stacd, void *exinf)
         claw_close();
 
         robot_logf(
-            (UB *)"[gripper] close setpoint %d degrees\n",
+            (UB *)"[gripper] holding at %d degrees\n",
             claw_get_angle()
         );
 
         (void)tk_dly_tsk(400);
-        claw_release();
-
-        robot_logf(
-            (UB *)"[gripper] close pulse finished; "
-                   "servo signal released\n"
-        );
-
         mission_checkpoint();
 
         for (;;) {
