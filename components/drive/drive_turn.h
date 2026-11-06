@@ -12,6 +12,8 @@
 #define TURN_STALL_MS           1500U
 #define TURN_MIN_SPEED          18
 #define TURN_MAX_SPEED          25
+#define TURN_SCAN_MIN_SPEED    14
+#define TURN_SCAN_MAX_SPEED    18
 #define TURN_KP                 0.8f
 #define TURN_KD                 0.12f
 
@@ -23,7 +25,8 @@
 ER drive_turn_run(
     float degrees,
     BOOL (*allowed)(void),
-    float *actual
+    float *actual,
+    BOOL slow_turn
 );
 
 #endif

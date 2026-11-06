@@ -21,11 +21,18 @@ static BOOL turn_now(UW *now)
 ER drive_turn_run(
     float degrees,
     BOOL (*allowed)(void),
-    float *actual)
+    float *actual,
+    BOOL slow_turn)
 {
+    const INT minimum_speed =
+        slow_turn ? TURN_SCAN_MIN_SPEED : TURN_MIN_SPEED;
+    const INT maximum_speed =
+        slow_turn ? TURN_SCAN_MAX_SPEED : TURN_MAX_SPEED;
+
     imu_heading_reading_t s = {0};
     UW started, now, progress_at, settled_at = 0;
     BOOL settling = FALSE;
+    BOOL scan_braking = FALSE;
     ER result = E_OK;
 
     motor_brake();
@@ -49,6 +56,7 @@ ER drive_turn_run(
         return E_SYS;
 
     const float origin = s.relative_deg;
+    const float direction = degrees < 0.0f ? -1.0f : 1.0f;
     const float target =
         origin + degrees * TURN_GYRO_RIGHT_SIGN;
 
@@ -103,7 +111,11 @@ ER drive_turn_run(
             progress_at = now;
         }
 
-        if (turn_abs(error) <= TURN_TOLERANCE_DEG) {
+        /* Scan turns brake at the target and never reverse to trim overshoot. */
+        if (slow_turn && error * direction <= TURN_TOLERANCE_DEG)
+            scan_braking = TRUE;
+
+        if (scan_braking || turn_abs(error) <= TURN_TOLERANCE_DEG) {
             motor_brake();
 
             if (turn_abs(rate) <= TURN_SETTLE_DPS) {
@@ -134,10 +146,10 @@ ER drive_turn_run(
             } else {
                 INT speed = (INT)turn_abs(output);
 
-                if (speed < TURN_MIN_SPEED)
-                    speed = TURN_MIN_SPEED;
-                if (speed > TURN_MAX_SPEED)
-                    speed = TURN_MAX_SPEED;
+                if (speed < minimum_speed)
+                    speed = minimum_speed;
+                if (speed > maximum_speed)
+                    speed = maximum_speed;
                 if (output < 0.0f)
                     speed = -speed;
 

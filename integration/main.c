@@ -18,14 +18,21 @@
 
 #define OBJECT_SCAN_COMMAND          "M,3\n"
 #define DIRECTION_SCAN_COMMAND       "M,8\n"
-#define SCAN_WINDOW_MS               1200
-#define OBJECT_STANDOFF_MM           100
+#define DIRECTION_SCAN_WINDOW_MS     1200U
+#define OBJECT_STANDOFF_MM           120
 #define DIRECTION_STANDOFF_MM        200
+#define OBJECT_NEAR_MARGIN_MM        60
+#define OBJECT_NEAR_CENTER_PX        16
+#define OBJECT_NEAR_ALIGN_DEG        3.0f
+#define OBJECT_NEAR_PULSE_MS         40
 
 #define DIRECTION_ALIGN_TOLERANCE_PX 74
 #define DIRECTION_ALIGN_STEP_DEG     5.0f
-#define DIRECTION_SEARCH_STEP_DEG    8.0f
-#define OBJECT_SCAN_STEP_DEG         10.0f
+#define MARKER_FIND_STEP_DEG         15.0f
+#define MARKER_SCAN_STEP_DEG         5.0f
+#define MARKER_SCAN_MAX_DEG          30.0f
+#define MARKER_SCAN_SETTLE_MS        150U
+#define OBJECT_SCAN_WINDOW_MS        1000U
 
 #define GYRO_TURN_TEST_ONLY          0
 
@@ -41,6 +48,8 @@
 #define MAX_APPROACH_STEPS          30
 #define MAX_LOST_SCAN_ATTEMPTS      3
 #define CAMERA_CENTER_X             160
+#define CAMERA_FOCAL_LENGTH_PX      277.0f
+#define DIRECTION_DRIFT_LIMIT_MM    20.0f
 
 #define DRIVE_RAMP_STEP             10
 #define DRIVE_RAMP_MS               15
@@ -70,6 +79,9 @@ typedef struct {
     BOOL stop;
     BOOL turn;
     float degrees;
+    BOOL slow_turn;
+    BOOL hold_heading;
+    float heading_target_deg;
 } DriveCommand;
 
 typedef struct {
@@ -1255,6 +1267,56 @@ static INT drive_toward(INT current, INT target)
     return current;
 }
 
+static BOOL drive_heading_trim(float target_yaw, INT *trim)
+{
+    imu_heading_reading_t heading = {0};
+    imu_heading_read(&heading);
+    if (!mission_imu_healthy(&heading)) {
+        mission_latch_stop("Gyro unavailable during forward drive");
+        return FALSE;
+    }
+
+    float drift_right = (heading.relative_deg - target_yaw) *
+                        TURN_GYRO_RIGHT_SIGN;
+    float correction = 0.0f;
+    if (drift_right > 0.75f || drift_right < -0.75f)
+        correction = 2.0f * drift_right;
+    if (correction > 8.0f)
+        correction = 8.0f;
+    else if (correction < -8.0f)
+        correction = -8.0f;
+
+    *trim = (INT)correction;
+    return TRUE;
+}
+
+static void drive_hold_heading(INT speed, UW duration_ms, float target_yaw)
+{
+    UW started;
+    if (!mission_now_ms(&started)) {
+        mission_latch_stop("Could not time forward drive");
+        return;
+    }
+
+    for (;;) {
+        UW now;
+        if (!mission_now_ms(&now)) {
+            mission_latch_stop("Could not time forward drive");
+            return;
+        }
+        if ((UW)(now - started) >= duration_ms || mission_is_stopped())
+            return;
+
+        INT trim;
+        if (!drive_heading_trim(target_yaw, &trim))
+            return;
+
+        motor_drive(speed - trim, speed + trim);
+        (void)tk_dly_tsk(1);
+    }
+}
+
+
 /*
  * This task remains the sole runtime owner of motor PWM.
  * It checks the interlock while ramping and during each pulse.
@@ -1315,7 +1377,8 @@ LOCAL void task_drive(INT stacd, void *exinf)
             reply.error = drive_turn_run(
                 command.degrees,
                 mission_motion_allowed,
-                &reply.actual_deg
+                &reply.actual_deg,
+                command.slow_turn
             );
 
             current_left = current_right = 0;
@@ -1339,7 +1402,24 @@ LOCAL void task_drive(INT stacd, void *exinf)
             motor_brake();
             current_left = 0;
             current_right = 0;
+
+            DriveTurnResult reply = { .error = E_OK };
+            if (tk_snd_mbf(turn_result_mbf_id, &reply,
+                        sizeof(reply), TMO_POL) < E_OK) {
+                mission_latch_stop("Could not confirm motor brake");
+            }
             continue;
+        }
+
+        const BOOL hold_heading = command.hold_heading;
+        imu_heading_reading_t start_heading = {0};
+        if (hold_heading) {
+            imu_heading_read(&start_heading);
+            if (!mission_imu_healthy(&start_heading)) {
+                mission_latch_stop("Gyro unavailable before forward drive");
+                motor_brake();
+                continue;
+            }
         }
 
         BOOL interrupted = FALSE;
@@ -1358,7 +1438,13 @@ LOCAL void task_drive(INT stacd, void *exinf)
             current_right =
                 drive_toward(current_right, command.right);
 
-            motor_drive(current_left, current_right);
+            INT trim = 0;
+            if (hold_heading &&
+                !drive_heading_trim(command.heading_target_deg, &trim)) {
+                interrupted = TRUE;
+                break;
+            }
+            motor_drive(current_left - trim, current_right + trim);
 
             if (!mission_checked_delay(DRIVE_RAMP_MS)) {
                 interrupted = TRUE;
@@ -1367,25 +1453,48 @@ LOCAL void task_drive(INT stacd, void *exinf)
         }
 
         if (!interrupted && command.ms > 0) {
-            (void)mission_checked_delay((UW)command.ms);
+            if (hold_heading) {
+                drive_hold_heading(command.left, (UW)command.ms,
+                                   command.heading_target_deg);
+            } else {
+                (void)mission_checked_delay((UW)command.ms);
+            }
         }
 
         motor_brake();
         current_left = 0;
         current_right = 0;
+
+        if (hold_heading && !interrupted && !mission_is_stopped()) {
+            imu_heading_reading_t end_heading = {0};
+            imu_heading_read(&end_heading);
+            if (mission_imu_healthy(&end_heading)) {
+                float drift_right =
+                    (end_heading.relative_deg - start_heading.relative_deg) *
+                    TURN_GYRO_RIGHT_SIGN;
+                robot_logf((UB *)"[drive] straight drift_cd=%d (right positive)\n",
+                           (INT)(100.0f * drift_right));
+            }
+        }
     }
 }
 
 static void drive_pulse(
     INT left,
     INT right,
-    INT duration_ms
+    INT duration_ms,
+    const float *heading_target_deg
 )
 {
     mission_checkpoint();
 
     DriveCommand command = {
-        left, right, duration_ms, FALSE
+        .left = left,
+        .right = right,
+        .ms = duration_ms,
+        .hold_heading = heading_target_deg != NULL,
+        .heading_target_deg =
+            heading_target_deg != NULL ? *heading_target_deg : 0.0f
     };
 
     if (tk_snd_mbf(
@@ -1410,27 +1519,26 @@ static void drive_pulse(
 
 static void drive_stop(void)
 {
-    DriveCommand command = {0, 0, 0, TRUE};
+    DriveCommand command = { .stop = TRUE };
+    DriveTurnResult reply = {0};
 
-    if (tk_snd_mbf(
-            drive_mbf_id,
-            &command,
-            sizeof(command),
-            TMO_FEVR
-        ) < E_OK) {
-        mission_latch_stop("Could not queue stop command");
+    mission_checkpoint();
+    if (tk_snd_mbf(drive_mbf_id, &command, sizeof(command), 1000) < E_OK ||
+        tk_rcv_mbf(turn_result_mbf_id, &reply, 1000) != (INT)sizeof(reply) ||
+        reply.error != E_OK) {
+        mission_latch_stop("Motor brake was not confirmed");
     }
-
-    (void)tk_dly_tsk(20);
+    mission_checkpoint();
 }
 
-static BOOL drive_turn_degrees(float degrees)
+static BOOL drive_turn_degrees_with_speed(float degrees, BOOL slow_turn)
 {
     mission_checkpoint();
 
     DriveCommand command = {0};
     command.turn = TRUE;
     command.degrees = degrees;
+    command.slow_turn = slow_turn;
 
     DriveTurnResult reply = {0};
     UW started, now;
@@ -1479,6 +1587,11 @@ static BOOL drive_turn_degrees(float degrees)
     return TRUE;
 }
 
+static BOOL drive_turn_degrees(float degrees)
+{
+    return drive_turn_degrees_with_speed(degrees, FALSE);
+}
+
 /* ---------- Camera scans and target selection ---------- */
 
 static void clear_scan_results(void)
@@ -1495,24 +1608,8 @@ static void clear_scan_results(void)
     (void)tk_unl_mtx(mtx_id);
 }
 
-static void request_marker_scan(
-    const char *command,
-    INT scan_ms
-)
-{
-    mission_checkpoint();
-
-    clear_scan_results();
-
-    send_mode_command(command);
-    (void)tk_dly_tsk(50);
-    send_mode_command(command);
-    (void)tk_dly_tsk((RELTIM)scan_ms);
-
-    mission_checkpoint();
-}
-
-static BOOL nearest_object(marker_reading_t *result)
+/* Object ID 0 selects the nearest valid object. */
+static BOOL select_object(INT id, marker_reading_t *result)
 {
     BOOL found = FALSE;
 
@@ -1520,7 +1617,9 @@ static BOOL nearest_object(marker_reading_t *result)
         return FALSE;
 
     for (int i = 0; i < object_count; ++i) {
-        if (object_map[i].id < 4)
+        if (object_map[i].id < 4 ||
+            (id != 0 && object_map[i].id != id) ||
+            !(object_map[i].distance > 0.0f))
             continue;
 
         if (!found ||
@@ -1606,31 +1705,136 @@ static INT clamp_int(
     return value;
 }
 
-static BOOL search_direction_marker(
-    INT marker_id, marker_reading_t *target)
+/* ID 0 selects the nearest marker of the requested kind. */
+static BOOL scan_marker(BOOL object_pickup, INT id, marker_reading_t *target)
 {
-    robot_logf((UB*)
-        "[mission] searching for direction marker\n");
+    const char *command = object_pickup
+        ? OBJECT_SCAN_COMMAND : DIRECTION_SCAN_COMMAND;
+    UW window_ms = object_pickup
+        ? OBJECT_SCAN_WINDOW_MS : DIRECTION_SCAN_WINDOW_MS;
 
-    const float sweep[2] = {
-        -DIRECTION_SEARCH_STEP_DEG,
-         DIRECTION_SEARCH_STEP_DEG * 2.0f
-    };
+    mission_checkpoint();
+    send_mode_command(command);
+    if (!mission_checked_delay(50U)) {
+        mission_checkpoint();
+        return FALSE;
+    }
+    send_mode_command(command);
 
-    for (INT i = 0; i < 2; ++i) {
-        if (!drive_turn_degrees(sweep[i]))
-            return FALSE;
-
-        request_marker_scan(
-            DIRECTION_SCAN_COMMAND, SCAN_WINDOW_MS);
-
-        if (read_direction(marker_id, target))
-            return TRUE;
+    /* Let frames captured during the turn clear before scanning. */
+    if (!mission_checked_delay(MARKER_SCAN_SETTLE_MS)) {
+        mission_checkpoint();
+        return FALSE;
     }
 
-    (void)drive_turn_degrees(-DIRECTION_SEARCH_STEP_DEG);
+    clear_scan_results();
+    if (!mission_checked_delay(window_ms)) {
+        mission_checkpoint();
+        return FALSE;
+    }
+
+    if (object_pickup)
+        return select_object(id, target);
+    if (id == 0)
+        return nearest_direction(target);
+    return read_direction(id, target);
+}
+
+/* Discovery keeps turning right until the camera acquires its first target. */
+static BOOL find_marker(BOOL object_pickup, marker_reading_t *target)
+{
+    const char *kind = object_pickup ? "object" : "direction";
+
     drive_stop();
-    return FALSE;
+    while (!scan_marker(object_pickup, 0, target)) {
+        robot_logf((UB *)"[%s search] no marker; turning right %d degrees\n",
+                   kind, (INT)MARKER_FIND_STEP_DEG);
+        if (!drive_turn_degrees_with_speed(MARKER_FIND_STEP_DEG, TRUE))
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOL turn_to_scan_heading(float target_yaw, INT sweep_direction)
+{
+    mission_checkpoint();
+
+    imu_heading_reading_t reading = {0};
+    imu_heading_read(&reading);
+    if (!mission_imu_healthy(&reading)) {
+        mission_latch_stop("Gyro unavailable during marker search");
+        mission_checkpoint();
+        return FALSE;
+    }
+
+    float degrees = (target_yaw - reading.relative_deg) * TURN_GYRO_RIGHT_SIGN;
+
+    /* A prior step may have coasted past this heading. Keep sweeping forward. */
+    if (sweep_direction != 0 && degrees * (float)sweep_direction <= 0.0f)
+        return TRUE;
+
+    return drive_turn_degrees_with_speed(degrees, TRUE);
+}
+
+static BOOL rescan_marker(BOOL object_pickup, INT id, marker_reading_t *target)
+{
+    drive_stop();
+
+    imu_heading_reading_t reading = {0};
+    imu_heading_read(&reading);
+    if (!mission_imu_healthy(&reading)) {
+        mission_latch_stop("Could not capture marker search origin");
+        mission_checkpoint();
+        return FALSE;
+    }
+
+    const float origin = reading.relative_deg;
+    const char *kind = object_pickup ? "object" : "direction";
+
+    robot_logf((UB *)"[%s rescan] saved origin REL_cd=%d\n",
+               kind, (INT)(origin * 100.0f));
+
+    for (INT side = -1; side <= 1; side += 2) {
+        for (float angle = MARKER_SCAN_STEP_DEG; ;
+             angle += MARKER_SCAN_STEP_DEG) {
+            if (angle > MARKER_SCAN_MAX_DEG)
+                angle = MARKER_SCAN_MAX_DEG;
+            float offset = (float)side * angle;
+            float target_yaw = origin + offset * TURN_GYRO_RIGHT_SIGN;
+
+            robot_logf((UB *)"[%s rescan] %s; offset_cd=%d\n",
+                       kind, side < 0 ? "left" : "right",
+                       (INT)(offset * 100.0f));
+
+            if (!turn_to_scan_heading(target_yaw, side))
+                return FALSE;
+
+            if (scan_marker(object_pickup, id, target)) {
+                robot_logf((UB *)"[%s rescan] found ID:%d at offset_cd=%d\n",
+                           kind, target->id, (INT)(offset * 100.0f));
+                return TRUE;
+            }
+            if (angle >= MARKER_SCAN_MAX_DEG)
+                break;
+        }
+
+        robot_logf((UB *)"[%s rescan] returning to origin\n", kind);
+        if (!turn_to_scan_heading(origin, 0))
+            return FALSE;
+    }
+
+    drive_stop();
+    if (object_pickup) {
+        robot_logf((UB *)"[object rescan] no marker in sweep; resuming object search\n");
+        return FALSE;
+    }
+
+    robot_logf((UB *)"[direction rescan] no marker in sweep; waiting at origin\n");
+    while (!scan_marker(object_pickup, id, target))
+        mission_checkpoint();
+
+    return TRUE;
 }
 
 static BOOL approach_marker(
@@ -1643,6 +1847,9 @@ static BOOL approach_marker(
     const BOOL object_pickup = marker_id == 0;
     INT lost_scans = 0;
     INT opening_candidate_id = 0;
+    marker_reading_t tracked_object = {0};
+    BOOL have_straight_heading = FALSE;
+    float straight_heading_deg = 0.0f;
 
     for (INT step = 0;
          step < MAX_APPROACH_STEPS;
@@ -1651,67 +1858,48 @@ static BOOL approach_marker(
         mission_checkpoint();
 
         marker_reading_t target = {0};
+        INT scan_id = object_pickup ? tracked_object.id : marker_id;
 
-        request_marker_scan(
-            object_pickup
-                ? OBJECT_SCAN_COMMAND
-                : DIRECTION_SCAN_COMMAND,
-            SCAN_WINDOW_MS
-        );
-
-        BOOL found = object_pickup
-            ? nearest_object(&target)
-            : read_direction(marker_id, &target);
-
-        if (!found) {
-            drive_stop();
+        if (scan_id == 0) {
+            if (!find_marker(TRUE, &target))
+                return FALSE;
+        } else if (!scan_marker(object_pickup, scan_id, &target)) {
+            have_straight_heading = FALSE;
             opening_candidate_id = 0;
 
-            if (object_pickup) {
-                robot_logf(
-                    (UB *)"[mission] no object visible; "
-                           "slowly rotating right to scan\n"
-                );
+            if (object_pickup && tracked_object.id != 0) {
+                INT last_mm = (INT)(tracked_object.distance + 0.5f);
+                if (last_mm <= standoff_mm + OBJECT_NEAR_MARGIN_MM) {
+                    drive_stop();
+                    ++lost_scans;
+                    robot_logf((UB *)
+                        "[pickup] lost ID:%d; last %d mm x:%d y:%d; "
+                        "stationary scan miss %d/%d\n",
+                        tracked_object.id, last_mm,
+                        tracked_object.x, tracked_object.y,
+                        lost_scans, MAX_LOST_SCAN_ATTEMPTS);
 
-                if (!drive_turn_degrees(OBJECT_SCAN_STEP_DEG))
-                    return FALSE;
+                    if (lost_scans < MAX_LOST_SCAN_ATTEMPTS)
+                        continue;
 
-                drive_stop();
-            } else {
-                found = search_direction_marker(
-                    marker_id,
-                    &target
-                );
-            }
-
-            if (!found) {
-                if (++lost_scans >= MAX_LOST_SCAN_ATTEMPTS) {
-                    robot_logf(
-                        (UB *)"[mission] target lost; "
-                               "stopping approach\n"
-                    );
-                    return FALSE;
+                    if (last_mm <= standoff_mm) {
+                        mission_latch_stop("Pickup marker lost within closing range");
+                        mission_checkpoint();
+                        return FALSE;
+                    }
                 }
-
-                robot_logf(
-                    (UB *)"[mission] target not visible; "
-                           "rescanning\n"
-                );
-                continue;
             }
+
+            if (!rescan_marker(object_pickup, scan_id, &target))
+                return FALSE;
         }
 
         lost_scans = 0;
-
-        if (object_pickup && !(target.distance > 0.0f)) {
-            drive_stop();
-            opening_candidate_id = 0;
-
-            robot_logf(
-                (UB *)"[mission] invalid object distance; rescanning\n"
-            );
-            continue;
-        }
+        INT distance_mm = (INT)(target.distance + 0.5f);
+        BOOL near_pickup = object_pickup &&
+            distance_mm <= standoff_mm + OBJECT_NEAR_MARGIN_MM;
+        if (object_pickup)
+            tracked_object = target;
 
         if (object_pickup &&
             gripper_opened != NULL &&
@@ -1754,17 +1942,29 @@ static BOOL approach_marker(
             continue;
         }
 
-        INT distance_mm = (INT)(target.distance + 0.5f);
-
+        INT error_x = target.x - CAMERA_CENTER_X;
         robot_logf(
             (UB *)"[mission] target ID:%d at %d mm "
-                   "(stop limit %d mm)\n",
-            target.id,
-            distance_mm,
-            standoff_mm
+                   "(stop limit %d mm); x:%d y:%d\n",
+            target.id, distance_mm, standoff_mm, target.x, target.y
         );
 
+        if (near_pickup &&
+            (error_x < -OBJECT_NEAR_CENTER_PX ||
+             error_x > OBJECT_NEAR_CENTER_PX)) {
+            have_straight_heading = FALSE;
+            drive_stop();
+            float degrees = error_x < 0
+                ? -OBJECT_NEAR_ALIGN_DEG : OBJECT_NEAR_ALIGN_DEG;
+            robot_logf((UB *)"[pickup] centering ID:%d x:%d\n",
+                       target.id, target.x);
+            if (!drive_turn_degrees(degrees))
+                return FALSE;
+            continue;
+        }
+
         if (distance_mm <= standoff_mm) {
+            have_straight_heading = FALSE;
             drive_stop();
             mission_checkpoint();
 
@@ -1778,20 +1978,22 @@ static BOOL approach_marker(
                     standoff_mm
                 );
 
-                request_marker_scan(
-                    OBJECT_SCAN_COMMAND,
-                    SCAN_WINDOW_MS
-                );
+                if (!scan_marker(TRUE, target.id, &confirmation)) {
+                    robot_logf((UB *)
+                        "[gripper] confirmation missed ID:%d; rescanning\n",
+                        target.id);
+                    continue;
+                }
 
-                if (!nearest_object(&confirmation) ||
-                    confirmation.id != target.id ||
-                    !(confirmation.distance > 0.0f) ||
-                    (INT)(confirmation.distance + 0.5f) > standoff_mm) {
-
-                    robot_logf(
-                        (UB *)"[gripper] pickup not confirmed; "
-                               "holding position and rescanning\n"
-                    );
+                INT confirmed_mm = (INT)(confirmation.distance + 0.5f);
+                INT confirmed_error_x = confirmation.x - CAMERA_CENTER_X;
+                if (confirmed_mm > standoff_mm ||
+                    confirmed_error_x < -OBJECT_NEAR_CENTER_PX ||
+                    confirmed_error_x > OBJECT_NEAR_CENTER_PX) {
+                    robot_logf((UB *)
+                        "[gripper] pickup not confirmed for ID:%d "
+                        "at %d mm x:%d; rescanning\n",
+                        confirmation.id, confirmed_mm, confirmation.x);
                     continue;
                 }
             }
@@ -1808,44 +2010,57 @@ static BOOL approach_marker(
             return TRUE;
         }
 
-        INT error_x = target.x - CAMERA_CENTER_X;
-        INT left;
-        INT right;
+        INT correction = near_pickup ? 0 : clamp_int(error_x / 8, -12, 12);
+        if (!object_pickup) {
+            float lateral_mm =
+                (float)error_x * target.distance / CAMERA_FOCAL_LENGTH_PX;
+            if (lateral_mm > DIRECTION_DRIFT_LIMIT_MM)
+                correction = clamp_int(correction, 3, 12);
+            else if (lateral_mm < -DIRECTION_DRIFT_LIMIT_MM)
+                correction = clamp_int(correction, -12, -3);
+            else
+                correction = 0;
 
-        if (!object_pickup &&
-            error_x >= -DIRECTION_ALIGN_TOLERANCE_PX &&
-            error_x <= DIRECTION_ALIGN_TOLERANCE_PX) {
-
-            left = CAR_DRIVE_SPEED;
-            right = CAR_DRIVE_SPEED;
-        } else {
-            INT correction = clamp_int(error_x / 8, -12, 12);
-
-            left = clamp_int(
-                CAR_DRIVE_SPEED + correction,
-                10,
-                40
-            );
-
-            right = clamp_int(
-                CAR_DRIVE_SPEED - correction,
-                10,
-                40
-            );
+            robot_logf((UB *)
+                "[mission] direction marker ID:%d lateral_mm=%d steering=%d\n",
+                target.id, (INT)lateral_mm, correction);
         }
 
-        robot_logf(
-            (UB *)"[mission] drive correction x:%d; "
-                   "L:%d R:%d\n",
-            target.x,
-            left,
-            right
-        );
+        INT left = clamp_int(CAR_DRIVE_SPEED + correction, 10, 40);
+        INT right = clamp_int(CAR_DRIVE_SPEED - correction, 10, 40);
+        INT pulse_ms = near_pickup ? OBJECT_NEAR_PULSE_MS : DRIVE_PULSE_MS;
 
-        drive_pulse(left, right, DRIVE_PULSE_MS);
+        BOOL hold_heading = correction == 0;
+        if (hold_heading && !have_straight_heading) {
+            imu_heading_reading_t reading = {0};
+            imu_heading_read(&reading);
+            if (!mission_imu_healthy(&reading)) {
+                mission_latch_stop("Could not capture straight heading");
+                mission_checkpoint();
+                return FALSE;
+            }
+            straight_heading_deg = reading.relative_deg;
+            robot_logf((UB *)"[mission] holding straight yaw REL_cd=%d\n",
+                       (INT)(straight_heading_deg * 100.0f));
+        }
+        have_straight_heading = hold_heading;
+
+        robot_logf(
+            (UB *)"[mission] drive correction x:%d; L:%d R:%d ms:%d\n",
+            target.x, left, right, pulse_ms
+        );
+        drive_pulse(left, right, pulse_ms,
+                    hold_heading ? &straight_heading_deg : NULL);
     }
 
     drive_stop();
+
+    if (tracked_object.id != 0 &&
+        (INT)(tracked_object.distance + 0.5f) <=
+            standoff_mm + OBJECT_NEAR_MARGIN_MM) {
+        mission_latch_stop("Pickup approach did not converge");
+        mission_checkpoint();
+    }
 
     robot_logf(
         (UB *)"[mission] approach step limit reached; "
@@ -1860,13 +2075,10 @@ static BOOL align_direction_marker(INT marker_id)
     for (INT step = 0; step < 12; ++step) {
         mission_checkpoint();
 
-        request_marker_scan(
-            DIRECTION_SCAN_COMMAND, SCAN_WINDOW_MS);
-
         marker_reading_t target = {0};
 
-        if (!read_direction(marker_id, &target) &&
-            !search_direction_marker(marker_id, &target)) {
+        if (!scan_marker(FALSE, marker_id, &target) &&
+            !rescan_marker(FALSE, marker_id, &target)) {
             drive_stop();
             return FALSE;
         }
@@ -1927,7 +2139,7 @@ LOCAL void task_state_machine(INT stacd, void *exinf)
 
             robot_logf(
                 (UB *)"[mission] no object reached; "
-                       "rescanning\n"
+                       "restarting 15-degree search\n"
             );
 
             (void)tk_dly_tsk(1000);
@@ -1952,27 +2164,8 @@ LOCAL void task_state_machine(INT stacd, void *exinf)
 
         for (;;) {
             marker_reading_t chosen_direction = {0};
-
-            for (;;) {
-                mission_checkpoint();
-
-                request_marker_scan(
-                    DIRECTION_SCAN_COMMAND,
-                    SCAN_WINDOW_MS
-                );
-
-                if (nearest_direction(&chosen_direction))
-                    break;
-
-                drive_stop();
-
-                robot_logf(
-                    (UB *)"[mission] no direction marker "
-                           "(IDs 1-3); rescanning\n"
-                );
-
-                (void)tk_dly_tsk(1000);
-            }
+            if (!find_marker(FALSE, &chosen_direction))
+                return;
 
             const char *direction_name =
                 direction_for_marker(chosen_direction.id);
@@ -2035,7 +2228,8 @@ LOCAL void task_state_machine(INT stacd, void *exinf)
                 drive_pulse(
                     -CAR_DRIVE_SPEED,
                     -CAR_DRIVE_SPEED,
-                    REVERSE_AFTER_RELEASE_MS
+                    REVERSE_AFTER_RELEASE_MS,
+                    NULL
                 );
 
                 drive_stop();
@@ -2153,6 +2347,24 @@ EXPORT INT usermain(void)
         (UB *)"[init] gripper PWM ready; "
                "signal idle until an object marker is detected\n"
     );
+    #if 0  /* Temporary gripper test. Change to #if 0 for the mission. */
+        motor_brake();
+
+        robot_logf((UB *)"[gripper test] OPEN\n");
+        claw_open();
+        (void)tk_dly_tsk(400);
+        claw_release();
+        robot_logf((UB *)"[gripper test] OPEN signal OFF\n");
+        (void)tk_dly_tsk(2000);
+
+        robot_logf((UB *)"[gripper test] CLOSE and HOLD\n");
+        claw_close();
+        (void)tk_dly_tsk(2000);
+        claw_release();
+        robot_logf((UB *)"[gripper test] CLOSE signal OFF\n");
+
+        mission_park();
+    #endif
 
     ER imu_er = imu_heading_start();
 
