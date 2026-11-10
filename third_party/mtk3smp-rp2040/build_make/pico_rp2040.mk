@@ -209,7 +209,17 @@ endif
 # a live hazard: an SMP=1 build was once flashed in place of an SMP=0 one and
 # only the banner in the log revealed it.
 #
-EXE_FILE := mtk3pico_smp$(SMP)_$(CONSOLE)$(WIFI_SUFFIX)
+CLAW_TEST ?= 0
+ifeq ($(CLAW_TEST),1)
+ifneq ($(CONSOLE):$(WIFI),usb_cdc:none)
+$(error CLAW_TEST=1 requires CONSOLE=usb_cdc and WIFI=none)
+endif
+CLAW_TEST_SUFFIX := _claw_test
+else ifneq ($(CLAW_TEST),0)
+$(error Unknown CLAW_TEST '$(CLAW_TEST)'; use 0 or 1)
+endif
+
+EXE_FILE := mtk3pico_smp$(SMP)_$(CONSOLE)$(WIFI_SUFFIX)$(CLAW_TEST_SUFFIX)
 
 GCC := arm-none-eabi-gcc
 AS := arm-none-eabi-gcc
@@ -259,6 +269,10 @@ CFLAGS  += -DCNF_SMP=1
 ASFLAGS += -DCNF_SMP=1
 endif
 
+ifeq ($(CLAW_TEST),1)
+CFLAGS += -DCLAW_SERIAL_TEST=1
+endif
+
 ################################################################################
 # Console selection
 #
@@ -286,7 +300,7 @@ endif
 # before any recipe executes.
 ################################################################################
 
-PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-join$(WIFI_JOIN)-netif$(WIFI_NETIF)-static$(WIFI_STATIC)-dhcp$(WIFI_DHCP)-dns$(WIFI_DNS)-log$(WIFI_LOG)-udp$(WIFI_UDP)-tcp$(WIFI_TCP)-bulk$(WIFI_TCPBULK)
+PROFILE_ID := smp$(SMP)-$(CONSOLE)-wifi$(WIFI)-join$(WIFI_JOIN)-netif$(WIFI_NETIF)-static$(WIFI_STATIC)-dhcp$(WIFI_DHCP)-dns$(WIFI_DNS)-log$(WIFI_LOG)-udp$(WIFI_UDP)-tcp$(WIFI_TCP)-bulk$(WIFI_TCPBULK)$(CLAW_TEST_SUFFIX)
 PROFILE_FILE := .build_profile
 
 ifneq ($(strip $(shell cat $(PROFILE_FILE) 2>/dev/null)),$(PROFILE_ID))

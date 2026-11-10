@@ -16,8 +16,8 @@
 
 #define CLAW_PIN        13
 
-#define CLAW_OPEN_DEG   35    /* <- calibrate */
-#define CLAW_CLOSE_DEG  45    /* calibrated for the 3 cm block with clearance */
+#define CLAW_OPEN_DEG   30
+#define CLAW_CLOSE_DEG  40
 
 /* Pulse range of the servo (SG90/MG90S style). Narrow it if the servo
    buzzes or hits its end stop at 0 or 180 degrees. */
