@@ -17,7 +17,7 @@
 #define CLAW_PIN        13
 
 #define CLAW_OPEN_DEG   30
-#define CLAW_CLOSE_DEG  40
+#define CLAW_CLOSE_DEG  50
 
 /* Pulse range of the servo (SG90/MG90S style). Narrow it if the servo
    buzzes or hits its end stop at 0 or 180 degrees. */

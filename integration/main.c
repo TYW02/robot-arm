@@ -18,7 +18,7 @@
 
 #define OBJECT_SCAN_COMMAND          "M,3\n"
 #define DIRECTION_SCAN_COMMAND       "M,8\n"
-#define DIRECTION_SCAN_WINDOW_MS     1200U
+#define DIRECTION_SCAN_WINDOW_MS     800U
 #define DIRECTION_MARKER_COUNT        3
 #define DIRECTION_MAP_STEP_DEG        15
 #define DIRECTION_MAP_REQUIRE_ALL     0  /* Set to 1 for the final arena. */
@@ -35,11 +35,11 @@
 #define MARKER_SCAN_STEP_DEG         5.0f
 #define MARKER_SCAN_MAX_DEG          30.0f
 #define MARKER_SCAN_SETTLE_MS        150U
-#define MARKER_RESCAN_WINDOW_MS      2000U
+#define MARKER_RESCAN_WINDOW_MS      1200U
 #define MARKER_SCAN_STILL_DPS        1.0f
 #define MARKER_SCAN_STILL_US         250000U
 #define MARKER_SCAN_STOP_TIMEOUT_MS  3000U
-#define OBJECT_SCAN_WINDOW_MS        1000U
+#define OBJECT_SCAN_WINDOW_MS        700U
 
 #define GYRO_TURN_TEST_ONLY          0
 
