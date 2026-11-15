@@ -37,6 +37,10 @@ IMPORT void	tm_tusb_write_char(char value);
 IMPORT void	tm_tusb_write_flush(void);
 IMPORT void	tm_tusb_discard_input(void);
 
+#ifdef CLAW_SERIAL_TEST
+IMPORT void claw_serial_test_poll(BOOL connected);
+#endif
+
 #define USB_TASK_PRIORITY	3
 #if TK_SUPPORT_SMP
 #define USB_TASK_STACK		4096
@@ -178,6 +182,11 @@ LOCAL void usb_service_task(INT stacd, void *exinf)
 				  ? (tm_tusb_connected() ? 3 : 2)
 				  : 1;
 
+#ifdef CLAW_SERIAL_TEST
+		/* RX and the claw both belong to this existing USB owner task. */
+		claw_serial_test_poll(tm_usb_link_state == 3);
+#endif
+
 		/* Gate on enumeration, not on DTR.  If the host is not reading,
 		   write_available() falls to zero and the loop simply stops --
 		   it never waits. */
@@ -201,7 +210,9 @@ LOCAL void usb_service_task(INT stacd, void *exinf)
 			}
 			tm_tusb_write_flush();
 		}
+#ifndef CLAW_SERIAL_TEST
 		tm_tusb_discard_input();
+#endif
 
 		/* Sleep until the controller interrupts, with a periodic
 		   fallback so the ring still drains when the link is idle. */
