@@ -98,17 +98,20 @@ static void robot_log_report(struct netif *netif, const ip4_addr_t *target)
               robot_log_last_err);
 }
 
-/* Command receive: a UDP listener on port 5006.  Each datagram is passed to
- * robot_cmd_receive() and answered with "OK\n" so the sender can see that the
- * Pico got it.  The callback runs inside cyw43_poll(), in this same task. */
+/* Command receive: a UDP listener on port 5006.  Each datagram is one operator
+ * command line.  It is passed to robot_cmd_receive(), and the text that comes
+ * back (reply, help or status) is sent to the sender.  The callback runs
+ * inside cyw43_poll(), in this same task. */
 #define CYW43_UTK_CMD_PORT 5006U
 static struct udp_pcb *robot_cmd_pcb;
+static char robot_cmd_reply[640];   /* only this task uses it */
 
 static void robot_cmd_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
                            const ip_addr_t *addr, u16_t port)
 {
-    unsigned char bytes[64];
+    unsigned char bytes[80];
     unsigned int length;
+    int reply_len;
     struct pbuf *reply;
 
     (void)arg;
@@ -117,11 +120,13 @@ static void robot_cmd_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
     (void)pbuf_copy_partial(p, bytes, (u16_t)length, 0);
     pbuf_free(p);
 
-    robot_cmd_receive(bytes, length);
+    reply_len = robot_cmd_receive(bytes, length, robot_cmd_reply,
+                                  (unsigned int)sizeof(robot_cmd_reply));
+    if(reply_len <= 0) return;
 
-    reply = pbuf_alloc(PBUF_TRANSPORT, 3, PBUF_RAM);
+    reply = pbuf_alloc(PBUF_TRANSPORT, (u16_t)reply_len, PBUF_RAM);
     if(reply != NULL) {
-        (void)pbuf_take(reply, "OK\n", 3);
+        (void)pbuf_take(reply, robot_cmd_reply, (u16_t)reply_len);
         (void)udp_sendto(pcb, reply, addr, port);
         pbuf_free(reply);
     }

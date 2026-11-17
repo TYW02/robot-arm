@@ -123,19 +123,35 @@ static void reject_unless_idle(char *reply)
         tm_sprintf((UB *)reply, (UB *)"rejected: mission running; stop first");
 }
 
-static void print_status(void)
+/* The status text, in one place: the USB console prints it, and the Wi-Fi
+   command port sends it back. out needs >= 256 bytes. */
+static void format_status(char *out, size_t len)
 {
     imu_heading_reading_t s = {0};
+    char held[16];
+
+    (void)len;
     imu_heading_read(&s);
 
-    tm_printf((UB *)"state: %s   holding: ", phase_name());
-    if (bridge_holding > 0) tm_printf((UB *)"object %d", (INT)bridge_holding);
-    else                    tm_printf((UB *)"-");
-    tm_printf((UB *)"   delivered: %d\n", (INT)bridge_delivered);
-    tm_printf((UB *)"stop: %s\n", stop_reason());
-    tm_printf((UB *)"imu: %s   turned %d deg since start-up\n",
-              mission_imu_healthy(&s) ? "OK" : "NOT READY/FAULT",
-              (INT)(s.relative_deg + (s.relative_deg < 0 ? -0.5f : 0.5f)));
+    if (bridge_holding > 0) tm_sprintf((UB *)held, (UB *)"object %d", (INT)bridge_holding);
+    else                    tm_sprintf((UB *)held, (UB *)"-");
+
+    tm_sprintf((UB *)out,
+               (UB *)"state: %s   holding: %s   delivered: %d\n"
+                     "stop: %s\n"
+                     "imu: %s   turned %d deg since start-up",
+               phase_name(), held, (INT)bridge_delivered,
+               stop_reason(),
+               mission_imu_healthy(&s) ? "OK" : "NOT READY/FAULT",
+               (INT)(s.relative_deg + (s.relative_deg < 0 ? -0.5f : 0.5f)));
+}
+
+static void print_status(void)
+{
+    char text[256];
+
+    format_status(text, sizeof text);
+    tm_printf((UB *)"%s\n", text);
 }
 
 static void do_start(char *reply)
@@ -275,6 +291,7 @@ static void cli_bridge_start(void)
         .execute     = cli_bridge_execute,
         .priority    = CLI_TASK_PRIORITY,
         .stack_bytes = CLI_STACK_MIN,
+        .status_text = format_status,
     };
     ID id = cli_utkernel_start(&cfg);
     if (id <= E_OK)

@@ -33,12 +33,22 @@ committed and a fresh clone does not have them.
    the Pico, and open the USB serial console (115200). Wait for `link=3` and
    `[wifi-log] own <ip> -> ...`. That `<ip>` is the Pico's address.
 
-5. **Test commands.**
-   `python3 tools/wifi_cmd_send.py <pico-ip> PING` should print
-   `Pico replied: 'OK'`.
-   Drive (wheels off the ground, IMU connected):
-   `python3 tools/wifi_drive.py <pico-ip>` (w/a/s/d drive, x stop, r give control
-   back to the mission, q quit).
+5. **Send operator commands.** They are the same commands as the USB console
+   (`help` lists them). One command:
+
+   ```
+   python3 tools/wifi_cmd_send.py <pico-ip> status
+   ```
+
+   It prints the Pico's answer (state, held object, stop reason, IMU). Or open an
+   interactive prompt:
+
+   ```
+   python3 tools/wifi_cli.py <pico-ip>
+   ```
+
+   Wheels off the ground for the first test: wait for `[mission] READY` in the
+   log, then `f` (drive forward, 30% for 500 ms), `l`, `r`, `b`, `stop`, `reset`.
 
 The sections below explain each part in more detail.
 
@@ -137,34 +147,35 @@ to the fixed `UTK_WIFI_LOG_TARGET_*` address instead.
 
 ## Sending commands to the Pico over Wi-Fi (UDP port 5006)
 
-The Pico listens on UDP port **5006** once it has an IP address. Each datagram is passed to
-`robot_cmd_receive()` in `integration/remote_cmd.c`, which currently only logs it, and the Pico
-replies `OK`.
+The Pico listens on UDP port **5006** once it has an IP address. Each datagram is **one operator
+command line**, the same text you would type on the USB console. It goes through the same parser
+(`components/cli`) and the same handlers (`integration/cli_bridge.c`) as the USB CLI, so the same
+rules apply: `start` only from IDLE, `stop` works at any time and stays latched until `reset`, the
+debug commands only work in IDLE, and the IMU safety interlock still guards every move. The Pico
+sends the answer back to the sender, and the log receiver shows a `[cmd] "<command>" -> <answer>` line.
+
+| Command | What it does | When it works |
+|---|---|---|
+| `start` | start the mission (360° wall-mapping sweep, then pick up and deliver blocks) | IDLE only |
+| `stop` (or `x`) | emergency stop; brakes the motors; the stop stays latched | any time |
+| `reset` | clear a stop and return to IDLE | only after a stop |
+| `status` | state, held block, blocks delivered, stop reason, gyro health | any time |
+| `help` (or `?`) | list the commands | any time |
+| `f` / `b` / `l` / `r` `[speed] [ms]` | forward / backward / spin left / spin right (default 30%, 500 ms) | IDLE only |
+| `drive <L> <R> [ms]` | each wheel -100 to 100 % | IDLE only |
+| `open` / `close` | claw to its open / close angle | IDLE only |
+| `claw <0-180>` / `claw off` | claw to an angle / stop the claw signal | IDLE only |
+| `stats` | worst command reply time so far, in µs (NFR1 evidence) | test only |
+
+Speed is 1-100 % and time is 1-5000 ms. Commands are not case-sensitive.
 
 ```bash
-# Pico IP is the "own x.x.x.x" in the [wifi-log] line on the USB console
-python3 tools/wifi_cmd_send.py 172.20.10.5 PING
+# The Pico IP is the "own x.x.x.x" in the [wifi-log] line
+python3 tools/wifi_cmd_send.py 172.20.10.5 status      # one command
+python3 tools/wifi_cli.py 172.20.10.5                   # interactive prompt
 ```
 
-Expected: the script prints `Pico replied: 'OK'`, and the console and the log receiver show
-`[cmd] received over Wi-Fi: "PING" (4 bytes)`. The Mac and the Pico must be on the same network, and
-UDP is unreliable, so a missing reply does not always mean the command was lost.
-
-## Driving the car from the keyboard (W/A/S/D)
-
-```bash
-python3 tools/wifi_drive.py <pico-ip>
-```
-
-| Key | Action |
-|---|---|
-| W / S | forward / backward |
-| A / D | turn left / right |
-| X or Space | stop |
-| R | give control back to the autonomous mission |
-| Q | stop and quit |
-
-Press a direction once and the car keeps going; the script re-sends it 10 times a second until you
-press another key or X. Each command only moves the car for ~150 ms, so if the script stops or Wi-Fi
-drops, the car stops by itself. The first W/A/S/D/X switches the car to manual mode (the autonomous
-mission's drive commands are ignored) until R is sent.
+If a command comes back with `rejected: not ready yet (IMU start-up)`, the car is still doing its
+IMU start-up checks: keep it still and flat, and wait for `[mission] READY: type 'start'` in the log.
+UDP is unreliable, so a missing reply does not always mean the command was lost. Do not send the
+same command from the USB console and over Wi-Fi at the same moment.
