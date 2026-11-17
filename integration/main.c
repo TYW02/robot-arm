@@ -1,3 +1,6 @@
+/* CLI: use the standard size_t, not syslib.h's (see cli_bridge.c). */
+#define PROHIBIT_DEF_SIZE_T
+#include <stddef.h>
 #include <tk/tkernel.h>
 #include <tm/tmonitor.h>
 #include <tk/smp.h>
@@ -120,6 +123,7 @@ static T_SPLOCK wifi_log_lock;
 
 static T_SPLOCK mission_guard_lock;
 static BOOL mission_stop_latched = FALSE;
+static const char *volatile mission_stop_reason;  /* CLI status */
 
 static marker_reading_t object_map[MAX_OBJECTS];
 static int object_count;
@@ -517,6 +521,8 @@ static void mission_latch_stop(const char *reason)
 
     first = !mission_stop_latched;
     mission_stop_latched = TRUE;
+    if (first)
+        mission_stop_reason = reason;
 
     (void)ISpinUnlock(&mission_guard_lock, intsts);
 
@@ -1483,14 +1489,6 @@ LOCAL void task_drive(INT stacd, void *exinf)
     }
 }
 
-/*
- * Set by the Wi-Fi remote (W/A/S/D/X). While TRUE the autonomous mission keeps
- * running but its drive commands are ignored, so the remote has sole control
- * of the wheels. The remote's "R" command clears it again. The IMU interlock in
- * task_drive() still applies to every command, remote or not.
- */
-static volatile BOOL remote_manual = FALSE;
-
 static void drive_pulse(
     INT left,
     INT right,
@@ -1499,13 +1497,6 @@ static void drive_pulse(
 )
 {
     mission_checkpoint();
-
-    if (remote_manual) {
-        (void)mission_checked_delay(
-            (UW)(duration_ms + DRIVE_RAMP_MS * 11)
-        );
-        return;
-    }
 
     DriveCommand command = {
         .left = left,
@@ -1541,9 +1532,6 @@ static void drive_stop(void)
     DriveCommand command = { .stop = TRUE };
     DriveTurnResult reply = {0};
 
-    if (remote_manual)
-        return;
-
     mission_checkpoint();
     if (tk_snd_mbf(drive_mbf_id, &command, sizeof(command), 1000) < E_OK ||
         tk_rcv_mbf(turn_result_mbf_id, &reply, 1000) != (INT)sizeof(reply) ||
@@ -1556,12 +1544,6 @@ static void drive_stop(void)
 static BOOL drive_turn_degrees_with_speed(float degrees, BOOL slow_turn)
 {
     mission_checkpoint();
-
-    /* Wi-Fi remote has the wheels: skip the mission's turn. */
-    if (remote_manual) {
-        (void)mission_checked_delay(200U);
-        return TRUE;
-    }
 
     DriveCommand command = {0};
     command.turn = TRUE;
@@ -1618,72 +1600,6 @@ static BOOL drive_turn_degrees_with_speed(float degrees, BOOL slow_turn)
 static BOOL drive_turn_degrees(float degrees)
 {
     return drive_turn_degrees_with_speed(degrees, FALSE);
-}
-
-/*
- * Remote drive entry points, called from the Wi-Fi radio task. They must never
- * block, so every send uses TMO_POL. Each drive command is a short 150 ms pulse:
- * if the commands stop arriving (key released, Wi-Fi lost) the car stops by
- * itself within about 0.2 s. Until the IMU startup check has passed, usermain()
- * has not created the drive queue yet, so commands are ignored (and said so).
- */
-#define REMOTE_PULSE_MS 150
-
-static BOOL remote_drive_ready(void)
-{
-    static UW not_ready_count;
-
-    if (drive_mbf_id > E_OK)
-        return TRUE;
-
-    if ((not_ready_count++ % 20U) == 0U) {
-        robot_logf(
-            (UB *)"[cmd] ignored: drive not ready "
-                   "(waiting for IMU startup)\n"
-        );
-    }
-    return FALSE;
-}
-
-void robot_remote_drive(int left, int right)
-{
-    T_RMBF waiting;
-    DriveCommand command = {
-        .left = left,
-        .right = right,
-        .ms = REMOTE_PULSE_MS
-    };
-
-    if (!remote_drive_ready())
-        return;
-
-    remote_manual = TRUE;
-
-    /* One command already queued: drop this one, so the car does not keep
-     * moving after the key is released. */
-    if (tk_ref_mbf(drive_mbf_id, &waiting) == E_OK && waiting.msgsz != 0)
-        return;
-
-    (void)tk_snd_mbf(drive_mbf_id, &command, sizeof(command), TMO_POL);
-}
-
-void robot_remote_stop(void)
-{
-    /* A zero-speed pulse, not the .stop command: the drive task answers .stop
-     * on turn_result_mbf, and nothing reads that from here. A zero-speed command
-     * ramps to 0 and then brakes, with no reply. */
-    DriveCommand command = { .left = 0, .right = 0, .ms = 0 };
-
-    if (!remote_drive_ready())
-        return;
-
-    remote_manual = TRUE;
-    (void)tk_snd_mbf(drive_mbf_id, &command, sizeof(command), TMO_POL);
-}
-
-void robot_remote_auto(void)
-{
-    remote_manual = FALSE;
 }
 
 /* ---------- Camera scans and target selection ---------- */
@@ -2415,6 +2331,10 @@ static BOOL align_direction_marker(INT marker_id)
     return FALSE;
 }
 
+/* ---------- Operator CLI (components/cli + cli_bridge.c) ---------- */
+
+#include "cli_bridge.c"
+
 /* ---------- Mission task ---------- */
 
 LOCAL void task_state_machine(INT stacd, void *exinf)
@@ -2422,13 +2342,20 @@ LOCAL void task_state_machine(INT stacd, void *exinf)
     (void)stacd;
     (void)exinf;
 
-    if (!map_direction_markers_at_startup())
-        return;
+    cli_bridge_wait_for_start();
+
+    /* A task must not return here: its return address is 0. Park instead,
+       so the operator can 'reset'. */
+    if (!map_direction_markers_at_startup()) {
+        mission_latch_stop("Direction mapping failed");
+        mission_park();
+    }
 
     robot_logf((UB *)"[mission] ENABLED: direction map ready; starting pickups.\n");
 
     for (;;) {
         mission_checkpoint();
+        cli_bridge_set_phase(PHASE_SEARCH, 0);
 
         robot_logf(
             (UB *)"\n[mission] starting cycle; "
@@ -2461,6 +2388,8 @@ LOCAL void task_state_machine(INT stacd, void *exinf)
 
         mission_checkpoint();
 
+        cli_bridge_set_phase(PHASE_GRIP, delivered_object_id);
+
         robot_logf(
             (UB *)"[mission] object reached; "
                    "closing gripper\n"
@@ -2476,14 +2405,18 @@ LOCAL void task_state_machine(INT stacd, void *exinf)
         (void)tk_dly_tsk(400);
         mission_checkpoint();
 
+        cli_bridge_set_phase(PHASE_DELIVER, delivered_object_id);
+
         BOOL search_any_direction = FALSE;
         for (;;) {
             marker_reading_t chosen_direction = {0};
             BOOL found_direction = search_any_direction
                 ? find_marker(FALSE, &chosen_direction)
                 : find_delivery_marker(&chosen_direction);
-            if (!found_direction)
-                return;
+            if (!found_direction) {
+                mission_latch_stop("No direction marker found");
+                mission_park();
+            }
 
             const char *direction_name =
                 direction_for_marker(chosen_direction.id);
@@ -2537,6 +2470,7 @@ LOCAL void task_state_machine(INT stacd, void *exinf)
                 mission_checkpoint();
 
                 mark_object_released(delivered_object_id);
+                cli_bridge_delivered(delivered_object_id);
 
                 robot_logf(
                     (UB *)"[mission] reversing away "
@@ -2667,6 +2601,8 @@ EXPORT INT usermain(void)
         (UB *)"[init] gripper PWM ready; "
                "signal idle until an object marker is detected\n"
     );
+
+    cli_bridge_start();
     #if 0  /* Temporary gripper test. Change to #if 0 for the mission. */
         motor_brake();
 

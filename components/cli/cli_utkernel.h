@@ -2,18 +2,17 @@
  * cli_utkernel.h - User Interface Task (USB serial CLI) for µT-Kernel 3 SMP
  * Owner: Reiner
  *
- * Built for the course port (sirfonzie/mtk3smp-rp2040, CONSOLE=usb_cdc).
- * Wraps the RTOS-free parser in cli.c. Same pattern as imu_utkernel:
- * start-up code creates the kernel objects and passes their IDs in.
+ * Built for the course port (third_party/mtk3smp-rp2040, CONSOLE=usb_cdc).
+ * Wraps the RTOS-free parser in cli.c:
  *
- *   UI -> Coordinator : cmd_mbf, one cmd_msg_t per message,
- *                       then cmd_flag_bit set on coord_flg
- *   STOP              : stop_flag_bit set on coord_flg ONLY (not queued),
- *                       so the Coordinator can act on it before queued commands
- *   Coordinator -> UI : ui_mbf, variable-length text (max CLI_UI_LINE_MAX bytes)
+ *   USB input -> UI Task (core 0) -> cli_parse_line() -> config.execute()
  *
- * Rules: the UI Task is the only task that prints after boot; it never blocks
- * on a kernel object (every send/receive uses TMO_POL).
+ * execute() is supplied by the integration layer (integration/cli_bridge.c).
+ * It applies the command (latch STOP, signal START, run a debug move...)
+ * and may overwrite the reply, e.g. "rejected: mission running".
+ *
+ * Rules: the UI Task never blocks on a kernel object, and execute() must
+ * return quickly, so STOP is acknowledged within the 200 ms target (NFR1).
  * Needs the port patch that adds tm_console_getc() (non-blocking USB input).
  */
 #ifndef CLI_UTKERNEL_H
@@ -28,17 +27,13 @@
 #include <tk/tkernel.h>
 #include "cli.h"
 
-#define CLI_UI_LINE_MAX   96   /* max bytes per Coordinator -> UI message */
 #define CLI_POLL_MS       10   /* input polling period */
 #define CLI_STACK_MIN     4096 /* port guidance: SMP kernel calls need >= 4 KiB */
 
 typedef struct {
-    ID   cmd_mbf;        /* UI -> Coordinator (maxmsz >= sizeof(cmd_msg_t)) */
-    ID   ui_mbf;         /* Coordinator -> UI (maxmsz >= CLI_UI_LINE_MAX)   */
-    ID   coord_flg;      /* Coordinator's event flag                        */
-    UINT cmd_flag_bit;   /* set after each queued command                   */
-    UINT stop_flag_bit;  /* set for STOP (not queued)                       */
-    PRI  priority;       /* 1 = HIGHEST. UI must be the lowest app task     */
+    /* Apply one valid command. Runs in the UI Task; must not wait long. */
+    void (*execute)(const cmd_msg_t *cmd, char *reply, size_t reply_len);
+    PRI  priority;       /* 1 = highest                                    */
     SZ   stack_bytes;    /* bytes, >= CLI_STACK_MIN                         */
 } cli_task_config_t;
 

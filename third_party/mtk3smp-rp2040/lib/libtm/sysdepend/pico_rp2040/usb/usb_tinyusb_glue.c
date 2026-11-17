@@ -68,12 +68,13 @@ void tm_tusb_discard_input(void)
     while (tud_cdc_available()) (void)tud_cdc_read_char();
 }
 
-#ifdef CLAW_SERIAL_TEST
+/* Next byte received from the host, or -1 if none.  Non-blocking.
+   Called only from the USB service task, which owns TinyUSB.
+   Used by the CLI input ring and by the claw serial test. */
 int tm_tusb_read_char(void)
 {
-    return (int)tud_cdc_read_char();
+    return tud_cdc_available() ? (int)tud_cdc_read_char() : -1;
 }
-#endif
 
 /*
  * Diagnostics.  The console cannot report on the console, so these are read

@@ -37,6 +37,7 @@ IMPORT void	tm_tusb_write_char(char value);
 IMPORT void	tm_tusb_write_flush(void);
 IMPORT void	tm_tusb_discard_input(void);
 
+IMPORT int	tm_tusb_read_char(void);
 #ifdef CLAW_SERIAL_TEST
 IMPORT void claw_serial_test_poll(BOOL connected);
 #endif
@@ -55,6 +56,15 @@ IMPORT void claw_serial_test_poll(BOOL connected);
 LOCAL UB		tx_buffer[USB_TX_SIZE];
 LOCAL volatile UW	tx_head;
 LOCAL volatile UW	tx_tail;
+
+/* Host -> Pico input ring (CLI).  The service task fills it; any task may
+   drain it with tm_console_getc().  Shares tx_lock: both rings are touched
+   only for a few instructions at a time. */
+#define USB_RX_SIZE		256U
+#define USB_RX_MASK		(USB_RX_SIZE - 1U)
+LOCAL UB		rx_buffer[USB_RX_SIZE];
+LOCAL volatile UW	rx_head;
+LOCAL volatile UW	rx_tail;
 LOCAL volatile UB	usb_started;
 
 #if TK_SUPPORT_SMP
@@ -88,6 +98,9 @@ LOCAL void tx_lock_leave(UINT intsts)
 /* Bytes discarded because the ring was full.  Exposed so a test can assert
    that a run produced no loss rather than assuming it. */
 EXPORT volatile UW	tm_usb_dropped;
+
+/* Input bytes discarded because the RX ring was full. */
+EXPORT volatile UW	tm_usb_rx_dropped;
 
 /*
  * Link state, for diagnostics that cannot rely on the console itself:
@@ -211,7 +224,23 @@ LOCAL void usb_service_task(INT stacd, void *exinf)
 			tm_tusb_write_flush();
 		}
 #ifndef CLAW_SERIAL_TEST
-		tm_tusb_discard_input();
+		/* Keep host input for the CLI instead of discarding it.
+		   (The claw test image reads it itself in claw_serial_test_poll.) */
+		{
+			int	c;
+			UW	rnext;
+			while((c = tm_tusb_read_char()) >= 0) {
+				tx_lock_enter(&intsts);
+				rnext = (rx_head + 1U) & USB_RX_MASK;
+				if(rnext == rx_tail) {
+					tm_usb_rx_dropped++;
+				} else {
+					rx_buffer[rx_head] = (UB)c;
+					rx_head = rnext;
+				}
+				tx_lock_leave(intsts);
+			}
+		}
 #endif
 
 		/* Sleep until the controller interrupts, with a periodic
@@ -299,6 +328,24 @@ EXPORT void tm_usb_console_put(const UB *buf, INT size)
 		tx_head = next;
 	}
 	tx_lock_leave(intsts);
+}
+
+/*
+ * Next byte typed by the host, or -1 if none.  Never blocks, so a CLI task
+ * can poll it without stalling the scheduler (unlike tm_getchar()).
+ */
+EXPORT INT tm_console_getc(void)
+{
+	UINT	intsts;
+	INT	c = -1;
+
+	tx_lock_enter(&intsts);
+	if(rx_tail != rx_head) {
+		c = rx_buffer[rx_tail];
+		rx_tail = (rx_tail + 1U) & USB_RX_MASK;
+	}
+	tx_lock_leave(intsts);
+	return c;
 }
 
 #endif /* USE_TMONITOR && TM_CONSOLE_USB_CDC */

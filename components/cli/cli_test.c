@@ -11,8 +11,8 @@ static bool     load_on = false;
 static void prompt(void) { printf("> "); fflush(stdout); }
 
 static void print_cmd(const cmd_msg_t *m) {
-    printf("   -> q_cmd: { type=%s, colour=%c, value=%d }\n",
-           cli_cmd_name(m->type), m->colour ? m->colour : '-', m->value);
+    printf("   -> cmd: { type=%s, a=%d, b=%d, c=%d }\n",
+           cli_cmd_name(m->type), m->a, m->b, m->c);
 }
 
 /* Test-only commands handled here, not part of the real CLI. */
