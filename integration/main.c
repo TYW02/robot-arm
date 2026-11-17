@@ -168,7 +168,7 @@ LOCAL UW drive_mbf_buffer[
 
 static void camera_rx_task (INT start_code, void * p_extension);
 static void camera_tx_task (INT start_code, void * p_extension);
-LOCAL void task_state_machine(INT stacd, void *exinf);
+static void mission_task (INT start_code, void * p_extension);
 LOCAL void task_drive(INT stacd, void *exinf);
 LOCAL void task_imu_monitor(INT stacd, void *exinf);
 
@@ -199,7 +199,7 @@ LOCAL T_CTSK ctsk_uart_tx = {
 LOCAL T_CTSK ctsk_state = {
     .itskpri = 10,
     .stksz = 4096,
-    .task = task_state_machine,
+    .task = mission_task,
 #if TK_SUPPORT_SMP
     .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC,
     .assprc = TP_PRC2,
@@ -2321,165 +2321,215 @@ static BOOL align_direction_marker(INT marker_id)
 
 /* ---------- Mission task ---------- */
 
-LOCAL void task_state_machine(INT stacd, void *exinf)
+#define MISSION_ANY_OBJECT_ID         0
+#define MISSION_GRIPPER_SETTLE_MS     400U
+#define MISSION_RETRY_DELAY_MS        1000U
+#define MISSION_NEXT_CYCLE_DELAY_MS   1000U
+
+typedef enum
 {
-    (void)stacd;
-    (void)exinf;
+    MISSION_MAP_DIRECTIONS,
+    MISSION_BEGIN_PICKUP,
+    MISSION_APPROACH_OBJECT,
+    MISSION_DELIVER_USING_MAP,
+    MISSION_DELIVER_USING_LIVE_SCAN,
+    MISSION_RELEASE_OBJECT,
+    MISSION_COMPLETE_CYCLE,
+    MISSION_FINISHED
+} mission_state_t;
 
+typedef struct
+{
+    /* Keep the kernel BOOL required by approach_marker(). */
+    BOOL gripper_opened;
+    INT  object_id;
+    INT  direction_id;
+} mission_cycle_t;
+
+/** Build the direction map once before starting the pickup cycles. */
+static mission_state_t mission_map_directions (void)
+{
     if (!map_direction_markers_at_startup())
-        return;
+    {
+        return MISSION_FINISHED;
+    }
 
-    robot_logf((UB *)"[mission] ENABLED: direction map ready; starting pickups.\n");
+    robot_logf((UB *)"[mission] ENABLED: direction map ready; "
+                     "starting pickups.\n");
 
-    for (;;) {
-        mission_checkpoint();
+    return MISSION_BEGIN_PICKUP;
+}
 
-        robot_logf(
-            (UB *)"\n[mission] starting cycle; "
-                   "looking for object ArUco IDs 4 and above\n"
-        );
+/** Reset the pickup data once per cycle, keeping it across retries. */
+static void mission_begin_pickup (mission_cycle_t * p_cycle)
+{
+    mission_checkpoint();
+    robot_logf((UB *)"\n[mission] starting cycle; "
+                     "looking for object ArUco IDs 4 and above\n");
+    robot_logf((UB *)"[gripper] signal idle; "
+                     "waiting for an object marker\n");
 
-        robot_logf(
-            (UB *)"[gripper] signal idle; "
-                   "waiting for an object marker\n"
-        );
+    p_cycle->gripper_opened = FALSE;
+    p_cycle->object_id = MISSION_ANY_OBJECT_ID;
+}
 
-        BOOL gripper_opened = FALSE;
-        INT delivered_object_id = 0;
+/** Run an object approach and close the gripper once it reaches the block. */
+static mission_state_t mission_pick_up_object (mission_cycle_t * p_cycle)
+{
+    bool const b_reached = (FALSE != approach_marker(MISSION_ANY_OBJECT_ID,
+                                                     OBJECT_STANDOFF_MM,
+                                                     &p_cycle->gripper_opened,
+                                                     &p_cycle->object_id));
+    mission_checkpoint();
 
-        while (!approach_marker(
-                    0,
-                    OBJECT_STANDOFF_MM,
-                    &gripper_opened,
-                    &delivered_object_id)) {
+    if (!b_reached)
+    {
+        robot_logf((UB *)"[mission] no object reached; "
+                         "restarting 15-degree search\n");
+        (void)tk_dly_tsk(MISSION_RETRY_DELAY_MS);
+        return MISSION_APPROACH_OBJECT;
+    }
 
-            mission_checkpoint();
+    robot_logf((UB *)"[mission] object reached; closing gripper\n");
+    claw_close();
+    robot_logf((UB *)"[gripper] holding at %d degrees\n", claw_get_angle());
+    (void)tk_dly_tsk(MISSION_GRIPPER_SETTLE_MS);
+    mission_checkpoint();
 
-            robot_logf(
-                (UB *)"[mission] no object reached; "
-                       "restarting 15-degree search\n"
-            );
+    return MISSION_DELIVER_USING_MAP;
+}
 
-            (void)tk_dly_tsk(1000);
-        }
+/** Align with the chosen direction marker before driving toward it. */
+static bool mission_approach_direction (marker_reading_t const * p_direction)
+{
+    char const * const p_name = direction_for_marker(p_direction->id);
 
-        mission_checkpoint();
+    robot_logf((UB *)"[mission] selected direction: %s (ID:%d, %d mm)\n",
+               p_name,
+               p_direction->id,
+               (INT)(p_direction->distance + 0.5f));
 
-        robot_logf(
-            (UB *)"[mission] object reached; "
-                   "closing gripper\n"
-        );
+    if (!align_direction_marker(p_direction->id))
+    {
+        return false;
+    }
 
-        claw_close();
+    robot_logf((UB *)"[mission] driving toward %s marker\n", p_name);
 
-        robot_logf(
-            (UB *)"[gripper] holding at %d degrees\n",
-            claw_get_angle()
-        );
+    return (FALSE != approach_marker(p_direction->id,
+                                     DIRECTION_STANDOFF_MM, NULL, NULL));
+}
 
-        (void)tk_dly_tsk(400);
-        mission_checkpoint();
+/** Deliver using the saved map first, then use live detections on retries. */
+static mission_state_t mission_deliver_object (mission_cycle_t * p_cycle,
+                                               bool b_search_live)
+{
+    marker_reading_t direction = {0};
+    bool const b_found = b_search_live
+        ? (FALSE != find_marker(FALSE, &direction))
+        : (FALSE != find_delivery_marker(&direction));
 
-        BOOL search_any_direction = FALSE;
-        for (;;) {
-            marker_reading_t chosen_direction = {0};
-            BOOL found_direction = search_any_direction
-                ? find_marker(FALSE, &chosen_direction)
-                : find_delivery_marker(&chosen_direction);
-            if (!found_direction)
-                return;
+    if (!b_found)
+    {
+        return MISSION_FINISHED;
+    }
 
-            const char *direction_name =
-                direction_for_marker(chosen_direction.id);
+    if (mission_approach_direction(&direction))
+    {
+        p_cycle->direction_id = direction.id;
+        return MISSION_RELEASE_OBJECT;
+    }
 
-            robot_logf(
-                (UB *)"[mission] selected direction: %s "
-                       "(ID:%d, %d mm)\n",
-                direction_name,
-                chosen_direction.id,
-                (INT)(chosen_direction.distance + 0.5f)
-            );
+    drive_stop();
+    mission_checkpoint();
+    robot_logf((UB *)"[mission] stopped before reaching direction marker; "
+                     "searching for any direction marker\n");
+    (void)tk_dly_tsk(MISSION_RETRY_DELAY_MS);
 
-            BOOL aligned =
-                align_direction_marker(chosen_direction.id);
+    return MISSION_DELIVER_USING_LIVE_SCAN;
+}
 
-            if (aligned) {
-                robot_logf(
-                    (UB *)"[mission] driving toward "
-                           "%s marker\n",
-                    direction_name
-                );
-            }
+/** Release the object, record its ID, and back away from the wall. */
+static void mission_release_object (mission_cycle_t const * p_cycle)
+{
+    mission_checkpoint();
 
-            if (aligned &&
-                approach_marker(
-                    chosen_direction.id,
-                    DIRECTION_STANDOFF_MM,
-                    NULL,
-                    NULL)) {
+    char const * const p_name = direction_for_marker(p_cycle->direction_id);
+    robot_logf((UB *)"[mission] reached %s marker; releasing object ID:%d\n",
+               p_name,
+               p_cycle->object_id);
 
+    claw_open();
+    robot_logf((UB *)"[gripper] release setpoint %d degrees\n",
+               claw_get_angle());
+    (void)tk_dly_tsk(MISSION_GRIPPER_SETTLE_MS);
+    claw_release();
+    mission_checkpoint();
+
+    mark_object_released(p_cycle->object_id);
+    robot_logf((UB *)"[mission] reversing away from delivery point\n");
+    drive_pulse(-CAR_DRIVE_SPEED, -CAR_DRIVE_SPEED,
+                REVERSE_AFTER_RELEASE_MS, NULL);
+    drive_stop();
+}
+
+/** Confirm the retreat has ended before starting another pickup. */
+static void mission_complete_cycle (void)
+{
+    drive_stop();
+    mission_checkpoint();
+    robot_logf((UB *)"[mission] cycle complete; starting next object scan\n");
+    (void)tk_dly_tsk(MISSION_NEXT_CYCLE_DELAY_MS);
+}
+
+/** Run the Pico mission on its existing kernel task. */
+static void mission_task (INT start_code, void * p_extension)
+{
+    (void)start_code;
+    (void)p_extension;
+
+    mission_state_t state = MISSION_MAP_DIRECTIONS;
+    mission_cycle_t cycle = {0};
+
+    while (MISSION_FINISHED != state)
+    {
+        switch (state)
+        {
+            case MISSION_MAP_DIRECTIONS:
+                state = mission_map_directions();
+            break;
+
+            case MISSION_BEGIN_PICKUP:
+                mission_begin_pickup(&cycle);
+                state = MISSION_APPROACH_OBJECT;
+            break;
+
+            case MISSION_APPROACH_OBJECT:
+                state = mission_pick_up_object(&cycle);
+            break;
+
+            case MISSION_DELIVER_USING_MAP:
+            case MISSION_DELIVER_USING_LIVE_SCAN:
+                state = mission_deliver_object(
+                    &cycle, (MISSION_DELIVER_USING_LIVE_SCAN == state));
+            break;
+
+            case MISSION_RELEASE_OBJECT:
+                mission_release_object(&cycle);
+                state = MISSION_COMPLETE_CYCLE;
+            break;
+
+            case MISSION_COMPLETE_CYCLE:
+                mission_complete_cycle();
+                state = MISSION_BEGIN_PICKUP;
+            break;
+
+            default:
+                mission_latch_stop("Invalid mission state");
                 mission_checkpoint();
-
-                robot_logf(
-                    (UB *)"[mission] reached %s marker; "
-                           "releasing object ID:%d\n",
-                    direction_name,
-                    delivered_object_id
-                );
-
-                claw_open();
-
-                robot_logf(
-                    (UB *)"[gripper] release setpoint "
-                           "%d degrees\n",
-                    claw_get_angle()
-                );
-
-                (void)tk_dly_tsk(400);
-                claw_release();
-
-                mission_checkpoint();
-
-                mark_object_released(delivered_object_id);
-
-                robot_logf(
-                    (UB *)"[mission] reversing away "
-                           "from delivery point\n"
-                );
-
-                drive_pulse(
-                    -CAR_DRIVE_SPEED,
-                    -CAR_DRIVE_SPEED,
-                    REVERSE_AFTER_RELEASE_MS,
-                    NULL
-                );
-
-                drive_stop();
-                break;
-            }
-
-            drive_stop();
-            mission_checkpoint();
-
-            /* Search live detections instead of reusing the saved aim. */
-            search_any_direction = TRUE;
-            robot_logf(
-                (UB *)"[mission] stopped before reaching "
-                       "direction marker; searching for any direction marker\n"
-            );
-
-            (void)tk_dly_tsk(1000);
+                state = MISSION_FINISHED;
+            break;
         }
-
-        drive_stop();
-        mission_checkpoint();
-
-        robot_logf(
-            (UB *)"[mission] cycle complete; "
-                   "starting next object scan\n"
-        );
-
-        (void)tk_dly_tsk(1000);
     }
 }
 
