@@ -48,3 +48,28 @@ add_custom_target(robotic_arm_clean
     WORKING_DIRECTORY "${MTK_BUILD_DIR}"
     USES_TERMINAL
     COMMENT "Cleaning μT-Kernel robot-arm build")
+
+# Opt-in only; keeps the normal mission image under its original filename.
+find_program(CLAW_TEST_PICOTOOL NAMES picotool
+    HINTS "$ENV{USERPROFILE}/.pico-sdk/picotool/2.3.1/picotool")
+set(CLAW_TEST_MAKE_ARGS)
+if(CLAW_TEST_PICOTOOL)
+    # Use the installed Pico tool when available; otherwise keep the BSP converter.
+    list(APPEND CLAW_TEST_MAKE_ARGS "E2U=")
+endif()
+
+add_custom_target(claw_serial_test
+    COMMAND "${MTK_MAKE_EXECUTABLE}" SMP=1 CONSOLE=usb_cdc CLAW_TEST=1 WIFI=none
+            "PICO_SDK_PATH=${PICO_SDK_PATH_MAKE}" ${CLAW_TEST_MAKE_ARGS}
+    WORKING_DIRECTORY "${MTK_BUILD_DIR}"
+    USES_TERMINAL
+    COMMENT "Building GP13 claw-only USB serial firmware"
+    VERBATIM)
+if(CLAW_TEST_PICOTOOL)
+    add_custom_command(TARGET claw_serial_test POST_BUILD
+        COMMAND "${CLAW_TEST_PICOTOOL}" uf2 convert
+                mtk3pico_smp1_usb_cdc_claw_test.elf mtk3pico_smp1_usb_cdc_claw_test.uf2
+                --family rp2040 --platform rp2040
+        WORKING_DIRECTORY "${MTK_BUILD_DIR}"
+        VERBATIM)
+endif()

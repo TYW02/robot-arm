@@ -1,0 +1,81 @@
+
+
+microT-Kernel Version 3.00
+
+Pico W vision app on micro T-Kernel SMP starting (reset: power-on or brown-out)...
+[init] gripper PWM ready; signal idle until an object marker is detected
+
+[mission] starting cycle; looking for object ArUco IDs 4 and above
+[gripper] signal idle; waiting for an object marker
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target lost; stopping approach
+[mission] no object reached; rescanning
+[wifi-scan] "Ah Tan Family" ch=1 rssi=-52 auth=0x5
+[wifi-scan] "" ch=1 rssi=-52 auth=0x5
+[wifi-scan] "TP-Link_0E66" ch=4 rssi=-66 auth=0x5
+[wifi-scan] "damien 🐳" ch=6 rssi=-52 auth=0x5
+[wifi-scan] "TP-Link_E8A0" ch=7 rssi=-82 auth=0x5
+[wifi-scan] "" ch=7 rssi=-78 auth=0x5
+[wifi-scan] "Ah Tan Family" ch=11 rssi=-76 auth=0x5
+[wifi-scan] "" ch=11 rssi=-76 auth=0x5
+[wifi-scan] "" ch=10 rssi=-92 auth=0x5
+[mission] no object visible; slowly rotating right to scan surroundings
+[wifi-scan] "mytripleA_2.4" ch=13 rssi=-99 auth=0x5
+[mission] target not visible; rescanning
+[wifi] ssid="damien" link=1 join_result=-5 attempt=1 best_rssi=-51 (link: 0 down, 1 joined, 2 no IP, 3 up, -1 failed, -2 SSID not found, -3 bad password)
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target lost; stopping approach
+[mission] no object reached; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target lost; stopping approach
+[mission] no object reached; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target lost; stopping approach
+[mission] no object reached; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target lost; stopping approach
+[mission] no object reached; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target lost; stopping approach
+[mission] no object reached; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target lost; stopping approach
+[mission] no object reached; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target lost; stopping approach
+[mission] no object reached; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings
+[mission] target not visible; rescanning
+[mission] no object visible; slowly rotating right to scan surroundings

@@ -44,6 +44,9 @@
 #include "network_config.h"
 #endif
 
+/* Plain prototype: tmonitor.h cannot be included next to lwIP (type clash). */
+extern int tm_printf(const unsigned char *format, ...);
+
 #define CYW43_POLL_MS        2
 /* Bounded so a reader can never wedge if the writer is starved; an exhausted
  * budget returns the last copy and is visible through status_retries. */
@@ -54,9 +57,90 @@
 
 #if TM_WIFI_LOG
 #define CYW43_UTK_LOG_PORT 5005U
+#define CYW43_UTK_LOG_REPORT_US 5000000ULL
 
+/* Set UTK_WIFI_LOG_BROADCAST to 1 in config/wifi_log_config.h to send to the
+ * subnet broadcast address instead of one fixed laptop IP.  The laptop then
+ * receives the logs whatever address DHCP gave it, so no rebuild is needed
+ * when that address changes. */
+#ifndef UTK_WIFI_LOG_BROADCAST
+#define UTK_WIFI_LOG_BROADCAST 0
+#endif
+
+extern uint64_t time_us_64(void);
 /* Log packets are sent only from this CYW43/lwIP owner task. */
 static struct udp_pcb *robot_log_pcb;
+static unsigned int robot_log_sent;
+static unsigned int robot_log_failed;
+static int robot_log_last_err;
+static uint32_t robot_log_reported_ip;
+static uint64_t robot_log_next_report_us;
+
+/* One USB line so a missing log stream can be told apart: no IP yet, wrong
+ * target, or lwIP refusing to send.  Printed when the IP appears and then
+ * every few seconds until the first packet has been sent. */
+static void robot_log_report(struct netif *netif, const ip4_addr_t *target)
+{
+    uint64_t now = time_us_64();
+    uint32_t own = netif_ip4_addr(netif)->addr;
+
+    if(own == robot_log_reported_ip && now < robot_log_next_report_us) return;
+    if(own == robot_log_reported_ip && robot_log_sent != 0
+       && robot_log_failed == 0) return;
+    robot_log_reported_ip = own;
+    robot_log_next_report_us = now + CYW43_UTK_LOG_REPORT_US;
+    tm_printf((const unsigned char*)"[wifi-log] own %d.%d.%d.%d -> %d.%d.%d.%d:%d sent=%u failed=%u last_err=%d\n",
+              ip4_addr1(netif_ip4_addr(netif)), ip4_addr2(netif_ip4_addr(netif)),
+              ip4_addr3(netif_ip4_addr(netif)), ip4_addr4(netif_ip4_addr(netif)),
+              ip4_addr1(target), ip4_addr2(target),
+              ip4_addr3(target), ip4_addr4(target),
+              (int)CYW43_UTK_LOG_PORT, robot_log_sent, robot_log_failed,
+              robot_log_last_err);
+}
+
+/* Command receive: a UDP listener on port 5006.  Each datagram is passed to
+ * robot_cmd_receive() and answered with "OK\n" so the sender can see that the
+ * Pico got it.  The callback runs inside cyw43_poll(), in this same task. */
+#define CYW43_UTK_CMD_PORT 5006U
+static struct udp_pcb *robot_cmd_pcb;
+
+static void robot_cmd_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                           const ip_addr_t *addr, u16_t port)
+{
+    unsigned char bytes[64];
+    unsigned int length;
+    struct pbuf *reply;
+
+    (void)arg;
+    if(p == NULL) return;
+    length = p->tot_len < sizeof(bytes) ? p->tot_len : (unsigned int)sizeof(bytes);
+    (void)pbuf_copy_partial(p, bytes, (u16_t)length, 0);
+    pbuf_free(p);
+
+    robot_cmd_receive(bytes, length);
+
+    reply = pbuf_alloc(PBUF_TRANSPORT, 3, PBUF_RAM);
+    if(reply != NULL) {
+        (void)pbuf_take(reply, "OK\n", 3);
+        (void)udp_sendto(pcb, reply, addr, port);
+        pbuf_free(reply);
+    }
+}
+
+static void robot_cmd_listen(void)
+{
+    if(robot_cmd_pcb != NULL) return;
+    robot_cmd_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+    if(robot_cmd_pcb == NULL) return;
+    if(udp_bind(robot_cmd_pcb, IP_ADDR_ANY, (u16_t)CYW43_UTK_CMD_PORT) != ERR_OK) {
+        udp_remove(robot_cmd_pcb);
+        robot_cmd_pcb = NULL;
+        return;
+    }
+    udp_recv(robot_cmd_pcb, robot_cmd_recv, NULL);
+    tm_printf((const unsigned char*)"[cmd] listening for commands on UDP port %d\n",
+              (int)CYW43_UTK_CMD_PORT);
+}
 
 static void robot_log_udp_poll(struct netif *netif)
 {
@@ -65,25 +149,49 @@ static void robot_log_udp_poll(struct netif *netif)
     ip4_addr_t target_ipv4;
     ip_addr_t destination;
     struct pbuf *packet;
+    err_t sent;
 
     if(netif == NULL || !netif_is_up(netif) || !netif_is_link_up(netif)
        || netif_ip4_addr(netif)->addr == 0) return;
 
+    robot_cmd_listen();
+
     if(robot_log_pcb == NULL) {
         robot_log_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
         if(robot_log_pcb == NULL) return;
+#if UTK_WIFI_LOG_BROADCAST
+        ip_set_option(robot_log_pcb, SOF_BROADCAST);
+#endif
     }
+
+#if UTK_WIFI_LOG_BROADCAST
+    ip4_addr_set_u32(&target_ipv4,
+                     (netif_ip4_addr(netif)->addr & netif_ip4_netmask(netif)->addr)
+                     | ~netif_ip4_netmask(netif)->addr);
+#else
+    IP4_ADDR(&target_ipv4, UTK_WIFI_LOG_TARGET_A,
+             UTK_WIFI_LOG_TARGET_B, UTK_WIFI_LOG_TARGET_C,
+             UTK_WIFI_LOG_TARGET_D);
+#endif
+    robot_log_report(netif, &target_ipv4);
 
     if(!robot_log_dequeue(bytes, sizeof(bytes), &length)) return;
     packet = pbuf_alloc(PBUF_TRANSPORT, (u16_t)length, PBUF_RAM);
-    if(packet == NULL) return;
+    if(packet == NULL) {
+        robot_log_failed++;
+        robot_log_last_err = ERR_MEM;
+        return;
+    }
     if(pbuf_take(packet, bytes, (u16_t)length) == ERR_OK) {
-        IP4_ADDR(&target_ipv4, UTK_WIFI_LOG_TARGET_A,
-                 UTK_WIFI_LOG_TARGET_B, UTK_WIFI_LOG_TARGET_C,
-                 UTK_WIFI_LOG_TARGET_D);
         ip_addr_copy_from_ip4(destination, target_ipv4);
-        (void)udp_sendto_if(robot_log_pcb, packet, &destination,
-                            (u16_t)CYW43_UTK_LOG_PORT, netif);
+        sent = udp_sendto_if(robot_log_pcb, packet, &destination,
+                             (u16_t)CYW43_UTK_LOG_PORT, netif);
+        if(sent == ERR_OK) {
+            robot_log_sent++;
+        } else {
+            robot_log_failed++;
+            robot_log_last_err = (int)sent;
+        }
     }
     pbuf_free(packet);
 }
@@ -488,6 +596,34 @@ static int scan_result(void *env, const cyw43_ev_scan_result_t *result)
     if(result->rssi > status->strongest_rssi) {
         status->strongest_rssi = result->rssi;
     }
+#if TM_WIFI_JOIN
+    {
+        /* Print each access point once (up to 32) so a failed join can be
+         * compared with what the radio actually hears: name, channel, signal
+         * and security.  auth 0x400004 = WPA2, 0x1400004 = WPA2/WPA3,
+         * 0x1000004 = WPA3 only, 0 = open. */
+        static uint8_t seen[32][6];
+        static unsigned int seen_count;
+        unsigned int i, k;
+        char name[33];
+
+        for(i = 0; i < seen_count; i++) {
+            for(k = 0; k < 6 && seen[i][k] == result->bssid[k]; k++) {}
+            if(k == 6) return 0;
+        }
+        if(seen_count >= 32) return 0;
+        for(k = 0; k < 6; k++) seen[seen_count][k] = result->bssid[k];
+        seen_count++;
+        for(k = 0; k < result->ssid_len && k < 32; k++) {
+            name[k] = (char)result->ssid[k];
+        }
+        name[k] = '\0';
+        tm_printf((const unsigned char*)
+                  "[wifi-scan] \"%s\" ch=%d rssi=%d auth=0x%x\n",
+                  name, (int)result->channel, (int)result->rssi,
+                  (unsigned int)result->auth_mode);
+    }
+#endif
     return 0;
 }
 
@@ -643,6 +779,50 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
                 radio_status.join_result = -CYW43_ETIMEDOUT;
                 mp_memory_barrir();
                 radio_status.join_complete = 1;
+            }
+        }
+        {
+            /* Join diagnostics and retry.  The original code made a single
+             * join attempt and never tried again, so one failed attempt (hotspot
+             * not yet visible, phone screen asleep) left the radio offline until
+             * the next reboot.  Report every 3 s while offline, and retry 5 s
+             * after a failed attempt. */
+            static uint64_t next_report_us;
+            static uint64_t retry_at_us;
+            static unsigned int join_attempts = 1;
+            uint64_t t = time_us_64();
+
+            if(radio_status.join_started && !radio_status.link_up
+               && t >= next_report_us) {
+                next_report_us = t + 3000000ULL;
+                tm_printf((const unsigned char*)
+                    "[wifi] ssid=\"%s\" link=%d join_result=%d attempt=%u best_rssi=%d"
+                    " (link: 0 down, 1 joined, 2 no IP, 3 up, -1 failed,"
+                    " -2 SSID not found, -3 bad password)\n",
+                    (const char*)wifi_ssid, (int)radio_status.link_status,
+                    (int)radio_status.join_result, join_attempts,
+                    (int)radio_status.strongest_rssi);
+            }
+            if(radio_status.join_started && radio_status.join_complete
+               && radio_status.join_result != 0 && !radio_status.link_up) {
+                if(retry_at_us == 0) {
+                    retry_at_us = t + 5000000ULL;
+                } else if(t >= retry_at_us) {
+                    retry_at_us = 0;
+                    join_attempts++;
+                    radio_status.join_complete = 0;
+                    join_started_us = t;
+                    result = cyw43_wifi_join(&cyw43_state,
+                                             sizeof(wifi_ssid) - 1, wifi_ssid,
+                                             sizeof(wifi_password) - 1,
+                                             wifi_password, UTK_WIFI_AUTH,
+                                             NULL, CYW43_CHANNEL_NONE);
+                    radio_status.join_request_result = result;
+                    if(result != 0) {
+                        radio_status.join_result = result;
+                        radio_status.join_complete = 1;
+                    }
+                }
             }
         }
 #endif

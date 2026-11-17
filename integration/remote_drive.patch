@@ -1,0 +1,127 @@
+--- ../new/robot-arm-feature-servo-control/integration/main.c	2026-11-11 17:19:42.000000000 +0800
++++ integration/main.c	2026-11-15 18:32:42.997654326 +0800
+@@ -1483,6 +1483,14 @@
+     }
+ }
+ 
++/*
++ * Set by the Wi-Fi remote (W/A/S/D/X). While TRUE the autonomous mission keeps
++ * running but its drive commands are ignored, so the remote has sole control
++ * of the wheels. The remote's "R" command clears it again. The IMU interlock in
++ * task_drive() still applies to every command, remote or not.
++ */
++static volatile BOOL remote_manual = FALSE;
++
+ static void drive_pulse(
+     INT left,
+     INT right,
+@@ -1492,6 +1500,13 @@
+ {
+     mission_checkpoint();
+ 
++    if (remote_manual) {
++        (void)mission_checked_delay(
++            (UW)(duration_ms + DRIVE_RAMP_MS * 11)
++        );
++        return;
++    }
++
+     DriveCommand command = {
+         .left = left,
+         .right = right,
+@@ -1526,6 +1541,9 @@
+     DriveCommand command = { .stop = TRUE };
+     DriveTurnResult reply = {0};
+ 
++    if (remote_manual)
++        return;
++
+     mission_checkpoint();
+     if (tk_snd_mbf(drive_mbf_id, &command, sizeof(command), 1000) < E_OK ||
+         tk_rcv_mbf(turn_result_mbf_id, &reply, 1000) != (INT)sizeof(reply) ||
+@@ -1539,6 +1557,12 @@
+ {
+     mission_checkpoint();
+ 
++    /* Wi-Fi remote has the wheels: skip the mission's turn. */
++    if (remote_manual) {
++        (void)mission_checked_delay(200U);
++        return TRUE;
++    }
++
+     DriveCommand command = {0};
+     command.turn = TRUE;
+     command.degrees = degrees;
+@@ -1596,6 +1620,72 @@
+     return drive_turn_degrees_with_speed(degrees, FALSE);
+ }
+ 
++/*
++ * Remote drive entry points, called from the Wi-Fi radio task. They must never
++ * block, so every send uses TMO_POL. Each drive command is a short 150 ms pulse:
++ * if the commands stop arriving (key released, Wi-Fi lost) the car stops by
++ * itself within about 0.2 s. Until the IMU startup check has passed, usermain()
++ * has not created the drive queue yet, so commands are ignored (and said so).
++ */
++#define REMOTE_PULSE_MS 150
++
++static BOOL remote_drive_ready(void)
++{
++    static UW not_ready_count;
++
++    if (drive_mbf_id > E_OK)
++        return TRUE;
++
++    if ((not_ready_count++ % 20U) == 0U) {
++        robot_logf(
++            (UB *)"[cmd] ignored: drive not ready "
++                   "(waiting for IMU startup)\n"
++        );
++    }
++    return FALSE;
++}
++
++void robot_remote_drive(int left, int right)
++{
++    T_RMBF waiting;
++    DriveCommand command = {
++        .left = left,
++        .right = right,
++        .ms = REMOTE_PULSE_MS
++    };
++
++    if (!remote_drive_ready())
++        return;
++
++    remote_manual = TRUE;
++
++    /* One command already queued: drop this one, so the car does not keep
++     * moving after the key is released. */
++    if (tk_ref_mbf(drive_mbf_id, &waiting) == E_OK && waiting.msgsz != 0)
++        return;
++
++    (void)tk_snd_mbf(drive_mbf_id, &command, sizeof(command), TMO_POL);
++}
++
++void robot_remote_stop(void)
++{
++    /* A zero-speed pulse, not the .stop command: the drive task answers .stop
++     * on turn_result_mbf, and nothing reads that from here. A zero-speed command
++     * ramps to 0 and then brakes, with no reply. */
++    DriveCommand command = { .left = 0, .right = 0, .ms = 0 };
++
++    if (!remote_drive_ready())
++        return;
++
++    remote_manual = TRUE;
++    (void)tk_snd_mbf(drive_mbf_id, &command, sizeof(command), TMO_POL);
++}
++
++void robot_remote_auto(void)
++{
++    remote_manual = FALSE;
++}
++
+ /* ---------- Camera scans and target selection ---------- */
+ 
+ static void clear_scan_results(void)
