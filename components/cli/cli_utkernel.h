@@ -35,11 +35,22 @@ typedef struct {
     void (*execute)(const cmd_msg_t *cmd, char *reply, size_t reply_len);
     PRI  priority;       /* 1 = highest                                    */
     SZ   stack_bytes;    /* bytes, >= CLI_STACK_MIN                         */
+    /* Optional: write the 'status' text (several lines, at most 255 chars)
+       into out. Used for commands that arrive over Wi-Fi, where there is no
+       USB console to print to. NULL = status is printed on USB only. */
+    void (*status_text)(char *out, size_t out_len);
 } cli_task_config_t;
 
 /* Create and start the UI Task, pinned to processor 1 (core 0), the core
    that owns the USB service task. Returns task ID or a negative error. */
 ID cli_utkernel_start(const cli_task_config_t *config);
+
+/* Run one complete command line that did not come from the USB console (the
+   Wi-Fi command port). Same parser and same execute() as the USB CLI. The
+   answer (reply, help text or status) is written to out, NUL-terminated;
+   returns its length (0 = nothing to say). out should hold >= 640 bytes.
+   Call it from one task at a time. */
+int cli_utkernel_exec_line(const char *line, char *out, unsigned int out_len);
 
 /* Worst-case acknowledgement time seen so far (µs), for NFR1 evidence. */
 UW cli_utkernel_worst_ack_us(void);

@@ -67,6 +67,47 @@ static void handle_line(const char *line, UW t_enter) {
 #endif
 }
 
+
+/* Copy text into out (truncating) and return the length. */
+static int put_text(char *out, unsigned int out_len, const char *text) {
+    unsigned int n = 0;
+    while (text[n] != '\0' && n + 1U < out_len) { out[n] = text[n]; n++; }
+    out[n] = '\0';
+    return (int)n;
+}
+
+int cli_utkernel_exec_line(const char *line, char *out, unsigned int out_len) {
+    cmd_msg_t m;
+    char reply[CLI_REPLY_MAX];
+    cli_result_t r;
+
+    if (!out || out_len == 0U) return 0;
+    out[0] = '\0';
+
+    if (!cfg.execute)                      /* UI task not started yet */
+        return put_text(out, out_len, "rejected: not ready yet (IMU start-up)");
+#if CLI_MEASURE_ACK
+    if (strcmp(line, "stats") == 0) {
+        char t[64];
+        tm_sprintf((UB *)t, (UB *)"worst_ack=%d us  usb_rx_drops=%d",
+                   (INT)worst_ack_us, (INT)tm_usb_rx_dropped_bytes());
+        return put_text(out, out_len, t);
+    }
+#endif
+    r = cli_parse_line(line, &m, reply, sizeof reply);
+    if (r == CLI_EMPTY) return 0;
+    if (r == CLI_HELP)  return put_text(out, out_len, cli_help_text());
+
+    if (r == CLI_OK) {
+        cfg.execute(&m, reply, sizeof reply);          /* may rewrite reply */
+        if (reply[0] == '\0' && m.type == CMD_STATUS && cfg.status_text) {
+            cfg.status_text(out, out_len);
+            return (int)strlen(out);
+        }
+    }
+    return put_text(out, out_len, reply);
+}
+
 static void task_entry(INT stacd, void *exinf) {
     (void)stacd;
     (void)exinf;
