@@ -576,11 +576,31 @@ static void update_dhcp_status(void)
         }
     }
 
+    /* Report DHCP progress every 3 s while waiting for an address, so the
+     * console shows what the radio is stuck on after the join succeeded. */
+    {
+        static uint64_t next_dhcp_report_us;
+
+        if(!radio_status.dhcp_complete && dhcp_started_us != 0
+           && now >= next_dhcp_report_us) {
+            next_dhcp_report_us = now + 3000000ULL;
+            tm_printf((const unsigned char*)
+                "[wifi] joined, waiting for IP: dhcp_elapsed=%u ms tries=%u\n",
+                (unsigned int)radio_status.dhcp_elapsed_ms,
+                (unsigned int)radio_status.dhcp_tries);
+        }
+    }
+
+    /* If no address arrives within 10 s, restart DHCP instead of waiting for
+     * the 30 s timeout and then never trying again. */
     if(!radio_status.dhcp_complete && dhcp_started_us != 0
-       && now - dhcp_started_us >= CYW43_DHCP_TIMEOUT_US) {
-        radio_status.dhcp_result = ERR_TIMEOUT;
-        mp_memory_barrir();
-        radio_status.dhcp_complete = 1;
+       && now - dhcp_started_us >= 10000000ULL) {
+        tm_printf((const unsigned char*)
+            "[wifi] no IP after 10 s, restarting DHCP\n");
+        dhcp_stop(netif);
+        (void)dhcp_start(netif);
+        dhcp_started_us = now;
+        radio_status.dhcp_elapsed_ms = 0;
     }
 }
 #endif
