@@ -1,3 +1,49 @@
+# Wi-Fi quick start (logs + remote commands)
+
+Do this once per person. Your Wi-Fi name and password stay on your own machine:
+`wifi_credentials.h` and `wifi_log_config.h` are gitignored, so they are never
+committed and a fresh clone does not have them.
+
+1. **Create your local Wi-Fi config.** From the project root:
+
+   ```
+   python3 tools/setup_wifi.py        # Windows: py tools\setup_wifi.py
+   ```
+
+   It asks for your Wi-Fi name and password and writes both config files in
+   `third_party/mtk3smp-rp2040/config/`. Use a plain 2.4 GHz network or phone
+   hotspot (no emoji in the name). iPhone hotspot: turn on *Maximize
+   Compatibility* and keep the Personal Hotspot screen open while the Pico joins.
+
+2. **Build with Wi-Fi on** (Wi-Fi is off in the default CMake build):
+
+   ```
+   cd third_party/mtk3smp-rp2040/build_make
+   make SMP=1 CONSOLE=usb_cdc WIFI=cyw43 WIFI_JOIN=1 WIFI_NETIF=1 WIFI_DHCP=1 WIFI_LOG=1 PICO_SDK_PATH=<path to your pico-sdk> -j8
+   ```
+
+   On macOS, if make stops with a "dependency file" error, run the same command
+   again. Rebuild and re-flash whenever you change the Wi-Fi name or password.
+   Never share the `.uf2`: it contains your password.
+
+3. **Flash.** Hold BOOTSEL, plug in the Pico W, and copy
+   `build_make/mtk3pico_smp1_usb_cdc_wifi_log.uf2` onto it.
+
+4. **Receive logs.** Start `python3 tools/wifi_log_receiver.py` before powering
+   the Pico, and open the USB serial console (115200). Wait for `link=3` and
+   `[wifi-log] own <ip> -> ...`. That `<ip>` is the Pico's address.
+
+5. **Test commands.**
+   `python3 tools/wifi_cmd_send.py <pico-ip> PING` should print
+   `Pico replied: 'OK'`.
+   Drive (wheels off the ground, IMU connected):
+   `python3 tools/wifi_drive.py <pico-ip>` (w/a/s/d drive, x stop, r give control
+   back to the mission, q quit).
+
+The sections below explain each part in more detail.
+
+---
+
 # Viewing robot logs over Wi-Fi
 
 The Pico W sends each robot log message by UDP unicast on port **5005**.
@@ -88,3 +134,37 @@ Setting `UTK_WIFI_LOG_BROADCAST 1` in `wifi_log_config.h` makes the Pico send to
 subnet broadcast address (shown as `x.y.z.255` in the status line), so the logs reach the
 laptop whatever address DHCP gave it. The example config enables it. Set it to 0 to send
 to the fixed `UTK_WIFI_LOG_TARGET_*` address instead.
+
+## Sending commands to the Pico over Wi-Fi (UDP port 5006)
+
+The Pico listens on UDP port **5006** once it has an IP address. Each datagram is passed to
+`robot_cmd_receive()` in `integration/remote_cmd.c`, which currently only logs it, and the Pico
+replies `OK`.
+
+```bash
+# Pico IP is the "own x.x.x.x" in the [wifi-log] line on the USB console
+python3 tools/wifi_cmd_send.py 172.20.10.5 PING
+```
+
+Expected: the script prints `Pico replied: 'OK'`, and the console and the log receiver show
+`[cmd] received over Wi-Fi: "PING" (4 bytes)`. The Mac and the Pico must be on the same network, and
+UDP is unreliable, so a missing reply does not always mean the command was lost.
+
+## Driving the car from the keyboard (W/A/S/D)
+
+```bash
+python3 tools/wifi_drive.py <pico-ip>
+```
+
+| Key | Action |
+|---|---|
+| W / S | forward / backward |
+| A / D | turn left / right |
+| X or Space | stop |
+| R | give control back to the autonomous mission |
+| Q | stop and quit |
+
+Press a direction once and the car keeps going; the script re-sends it 10 times a second until you
+press another key or X. Each command only moves the car for ~150 ms, so if the script stops or Wi-Fi
+drops, the car stops by itself. The first W/A/S/D/X switches the car to manual mode (the autonomous
+mission's drive commands are ignored) until R is sent.

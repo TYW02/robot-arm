@@ -98,6 +98,50 @@ static void robot_log_report(struct netif *netif, const ip4_addr_t *target)
               robot_log_last_err);
 }
 
+/* Command receive: a UDP listener on port 5006.  Each datagram is passed to
+ * robot_cmd_receive() and answered with "OK\n" so the sender can see that the
+ * Pico got it.  The callback runs inside cyw43_poll(), in this same task. */
+#define CYW43_UTK_CMD_PORT 5006U
+static struct udp_pcb *robot_cmd_pcb;
+
+static void robot_cmd_recv(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                           const ip_addr_t *addr, u16_t port)
+{
+    unsigned char bytes[64];
+    unsigned int length;
+    struct pbuf *reply;
+
+    (void)arg;
+    if(p == NULL) return;
+    length = p->tot_len < sizeof(bytes) ? p->tot_len : (unsigned int)sizeof(bytes);
+    (void)pbuf_copy_partial(p, bytes, (u16_t)length, 0);
+    pbuf_free(p);
+
+    robot_cmd_receive(bytes, length);
+
+    reply = pbuf_alloc(PBUF_TRANSPORT, 3, PBUF_RAM);
+    if(reply != NULL) {
+        (void)pbuf_take(reply, "OK\n", 3);
+        (void)udp_sendto(pcb, reply, addr, port);
+        pbuf_free(reply);
+    }
+}
+
+static void robot_cmd_listen(void)
+{
+    if(robot_cmd_pcb != NULL) return;
+    robot_cmd_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
+    if(robot_cmd_pcb == NULL) return;
+    if(udp_bind(robot_cmd_pcb, IP_ADDR_ANY, (u16_t)CYW43_UTK_CMD_PORT) != ERR_OK) {
+        udp_remove(robot_cmd_pcb);
+        robot_cmd_pcb = NULL;
+        return;
+    }
+    udp_recv(robot_cmd_pcb, robot_cmd_recv, NULL);
+    tm_printf((const unsigned char*)"[cmd] listening for commands on UDP port %d\n",
+              (int)CYW43_UTK_CMD_PORT);
+}
+
 static void robot_log_udp_poll(struct netif *netif)
 {
     unsigned char bytes[240];
@@ -109,6 +153,8 @@ static void robot_log_udp_poll(struct netif *netif)
 
     if(netif == NULL || !netif_is_up(netif) || !netif_is_link_up(netif)
        || netif_ip4_addr(netif)->addr == 0) return;
+
+    robot_cmd_listen();
 
     if(robot_log_pcb == NULL) {
         robot_log_pcb = udp_new_ip_type(IPADDR_TYPE_V4);
