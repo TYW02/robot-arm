@@ -25,6 +25,9 @@ IMPORT INT		tm_usb_diag_level(void);/* bring-up level, 0..8 */
 IMPORT UW		tm_usb_pending(void);	/* bytes still queued   */
 IMPORT volatile UW	tm_usb_dropped;		/* bytes lost to overrun*/
 Inline UW tm_usb_dropped_bytes(void)	{ return tm_usb_dropped; }
+IMPORT INT		tm_console_getc(void);	/* -1 if no byte waiting */
+IMPORT volatile UW	tm_usb_rx_dropped;	/* input lost to overrun */
+Inline UW tm_usb_rx_dropped_bytes(void)	{ return tm_usb_rx_dropped; }
 #else
 /* UART build: tm_printf writes straight to the UART from the calling context.
    There is no ring, so it is always "up", never pending and never drops. */
@@ -32,6 +35,13 @@ Inline UW  tm_usb_state(void)		{ return 3; }
 Inline INT tm_usb_diag_level(void)	{ return 8; }
 Inline UW  tm_usb_pending(void)		{ return 0; }
 Inline UW  tm_usb_dropped_bytes(void)	{ return 0; }
+Inline UW  tm_usb_rx_dropped_bytes(void)	{ return 0; }
+/* Non-blocking UART0 read (FR.RXFE = bit 4), unlike tm_getchar(). */
+Inline INT tm_console_getc(void)
+{
+	if((*(volatile UW *)0x40034018) & (1U << 4)) return -1;
+	return (INT)((*(volatile UW *)0x40034000) & 0xffU);
+}
 #endif
 
 #endif /* USB_CONSOLE_COMPAT_H */
