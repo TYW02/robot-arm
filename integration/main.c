@@ -1,5 +1,6 @@
-/* CLI: use the standard size_t, not syslib.h's (see cli_bridge.c). */
+/* Use the standard size_t required by the math and kernel headers. */
 #define PROHIBIT_DEF_SIZE_T
+
 #include <stddef.h>
 #include <tk/tkernel.h>
 #include <tm/tmonitor.h>
@@ -10,7 +11,11 @@
 #include "../components/drive/claw.h"
 #include "../components/drive/drive_turn.h"
 
+#include <float.h>
+#include <math.h>
 #include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 /* ---------- Configuration ---------- */
 
@@ -83,6 +88,16 @@ typedef struct {
     UB bytes[4];
 } ModeCommand;
 
+/* Bytes and diagnostics kept between camera UART reads. */
+typedef struct
+{
+    char     frame[RX_LINE_SIZE];
+    char     noise[16];
+    uint32_t length;
+    uint32_t noise_length;
+    UW       discarded_bytes;
+} camera_rx_state_t;
+
 typedef struct {
     INT left;
     INT right;
@@ -107,10 +122,17 @@ typedef struct {
     float distance;
 } marker_reading_t;
 
-typedef struct {
-    BOOL mapped;
-    float bearing_deg;
-    INT center_error_px;
+typedef float float32_t;
+
+_Static_assert((sizeof(float32_t) == 4U) && (FLT_RADIX == 2) &&
+               (FLT_MANT_DIG == 24), "The startup map requires binary32 float.");
+
+typedef struct
+{
+    bool      b_is_mapped;
+    float32_t bearing_deg;
+    float32_t distance_mm;
+    int32_t   center_error_px;
 } direction_bearing_t;
 
 /* ---------- Shared state ---------- */
@@ -131,11 +153,14 @@ static BOOL released_object_ids[MAX_ARUCO_IDS];
 
 static marker_reading_t direction_map[DIRECTION_MARKER_COUNT];
 static BOOL direction_seen[DIRECTION_MARKER_COUNT];
-static int direction_count;
 
 /* Mission-owned map. Index 0 stores ID 1, relative to the startup heading. */
-static direction_bearing_t startup_bearings[DIRECTION_MARKER_COUNT];
-static float startup_map_yaw_deg;
+static direction_bearing_t g_startup_bearings[DIRECTION_MARKER_COUNT] = {0};
+static float32_t g_startup_map_yaw_deg = 0.0f;
+
+static int32_t const g_full_turn_deg = 360;
+static int32_t const g_centidegrees_per_degree = 100;
+static float32_t const g_degrees_per_radian = 57.2957795f;
 
 /* ---------- Kernel objects ---------- */
 
@@ -159,16 +184,16 @@ LOCAL UW drive_mbf_buffer[
     (4 * (sizeof(DriveCommand) + 4)) / sizeof(UW) + 8
 ];
 
-LOCAL void task_uart_rx(INT stacd, void *exinf);
-LOCAL void task_uart_tx(INT stacd, void *exinf);
-LOCAL void task_state_machine(INT stacd, void *exinf);
+static void camera_rx_task (INT start_code, void * p_extension);
+static void camera_tx_task (INT start_code, void * p_extension);
+static void mission_task (INT start_code, void * p_extension);
 LOCAL void task_drive(INT stacd, void *exinf);
 LOCAL void task_imu_monitor(INT stacd, void *exinf);
 
 LOCAL T_CTSK ctsk_uart_rx = {
     .itskpri = 5,
     .stksz = 4096,
-    .task = task_uart_rx,
+    .task = camera_rx_task,
 #if TK_SUPPORT_SMP
     .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC,
     .assprc = TP_PRC1,
@@ -180,7 +205,7 @@ LOCAL T_CTSK ctsk_uart_rx = {
 LOCAL T_CTSK ctsk_uart_tx = {
     .itskpri = 6,
     .stksz = 4096,
-    .task = task_uart_tx,
+    .task = camera_tx_task,
 #if TK_SUPPORT_SMP
     .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC,
     .assprc = TP_PRC1,
@@ -192,7 +217,7 @@ LOCAL T_CTSK ctsk_uart_tx = {
 LOCAL T_CTSK ctsk_state = {
     .itskpri = 10,
     .stksz = 4096,
-    .task = task_state_machine,
+    .task = mission_task,
 #if TK_SUPPORT_SMP
     .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC,
     .assprc = TP_PRC2,
@@ -766,494 +791,478 @@ LOCAL void task_imu_monitor(INT stacd, void *exinf)
     }
 }
 
-/* ---------- Camera data helpers ---------- */
+/* ---------- Camera UART framing and detections ---------- */
 
-static const char *direction_for_marker(int id)
+/** Translate a direction marker ID into the name used by mission logs. */
+static char const * direction_for_marker (int id)
 {
-    switch (id) {
-    case 1: return "North";
-    case 2: return "West";
-    case 3: return "East";
-    default: return NULL;
+    switch (id)
+    {
+        case 1: return "North";
+        case 2: return "West";
+        case 3: return "East";
+        default: return NULL;
     }
 }
 
-int my_strlen(const char *s)
+/** Find the first checksum separator in a null-terminated frame. */
+static char * camera_checksum_start (char * p_frame)
 {
-    int len = 0;
-    while (*s++)
-        len++;
-    return len;
-}
-
-char *my_strchr(const char *s, int c)
-{
-    while (*s != (char)c) {
-        if (!*s++)
-            return 0;
-    }
-    return (char *)s;
-}
-
-char *my_strstr(const char *haystack, const char *needle)
-{
-    if (!*needle)
-        return (char *)haystack;
-
-    char *p1 = (char *)haystack;
-
-    while (*p1) {
-        char *p1_begin = p1;
-        char *p2 = (char *)needle;
-
-        while (*p1 && *p2 && *p1 == *p2) {
-            p1++;
-            p2++;
-        }
-
-        if (!*p2)
-            return p1_begin;
-
-        p1 = p1_begin + 1;
+    while ((*p_frame != '\0') && (*p_frame != '*'))
+    {
+        ++p_frame;
     }
 
-    return 0;
+    return ((*p_frame == '*') ? p_frame : NULL);
 }
 
-int parse_int(char **str)
+/** Consume one unsigned decimal field, including its comma if present. */
+static int camera_parse_integer (char ** pp_field)
 {
-    int res = 0;
+    int value = 0;
+    char * p_cursor = *pp_field;
 
-    while (**str >= '0' && **str <= '9') {
-        res = res * 10 + (**str - '0');
-        (*str)++;
+    while ((*p_cursor >= '0') && (*p_cursor <= '9'))
+    {
+        value = (value * 10) + (*p_cursor - '0');
+        ++p_cursor;
     }
 
-    if (**str == ',')
-        (*str)++;
+    if (*p_cursor == ',')
+    {
+        ++p_cursor;
+    }
 
-    return res;
+    *pp_field = p_cursor;
+    return value;
 }
 
-float parse_float(char **str)
+/** Consume one signed decimal field using the camera's fixed-point text. */
+static float camera_parse_decimal (char ** pp_field)
 {
-    float res = 0.0f;
+    float value = 0.0f;
     int sign = 1;
+    char * p_cursor = *pp_field;
 
-    if (**str == '-') {
+    if (*p_cursor == '-')
+    {
         sign = -1;
-        (*str)++;
+        ++p_cursor;
     }
 
-    while (**str >= '0' && **str <= '9') {
-        res = res * 10.0f + (**str - '0');
-        (*str)++;
+    while ((*p_cursor >= '0') && (*p_cursor <= '9'))
+    {
+        value = (value * 10.0f) + (*p_cursor - '0');
+        ++p_cursor;
     }
 
-    if (**str == '.') {
-        float frac = 0.1f;
-        (*str)++;
+    if (*p_cursor == '.')
+    {
+        float fraction = 0.1f;
+        ++p_cursor;
 
-        while (**str >= '0' && **str <= '9') {
-            res += (**str - '0') * frac;
-            frac *= 0.1f;
-            (*str)++;
+        while ((*p_cursor >= '0') && (*p_cursor <= '9'))
+        {
+            value += (*p_cursor - '0') * fraction;
+            fraction *= 0.1f;
+            ++p_cursor;
         }
     }
 
-    if (**str == ',')
-        (*str)++;
-
-    return res * sign;
-}
-
-static int uart_hex_value(char ch)
-{
-    if (ch >= '0' && ch <= '9')
-        return ch - '0';
-
-    if (ch >= 'A' && ch <= 'F')
-        return ch - 'A' + 10;
-
-    if (ch >= 'a' && ch <= 'f')
-        return ch - 'a' + 10;
-
-    return -1;
-}
-
-void send_mode_command(const char *mode)
-{
-    ModeCommand command = {{0, 0, 0, 0}};
-    UW len = 0;
-
-    while (len < sizeof(command.bytes) &&
-           mode[len] != '\0') {
-        command.bytes[len] = (UB)mode[len];
-        ++len;
+    if (*p_cursor == ',')
+    {
+        ++p_cursor;
     }
 
-    if (len == 0 ||
-        tk_snd_mbf(
-            command_mbf_id,
-            &command,
-            sizeof(command),
-            TMO_FEVR
-        ) < E_OK) {
+    *pp_field = p_cursor;
+    return value * sign;
+}
 
-        robot_logf(
-            (UB *)"[UART] failed to queue mode command\n"
-        );
+/** Decode a hexadecimal checksum digit. */
+static int camera_hex_value (char digit)
+{
+    if ((digit >= '0') && (digit <= '9'))
+    {
+        return digit - '0';
+    }
+    else if ((digit >= 'A') && (digit <= 'F'))
+    {
+        return (digit - 'A') + 10;
+    }
+    else if ((digit >= 'a') && (digit <= 'f'))
+    {
+        return (digit - 'a') + 10;
+    }
+    else
+    {
+        return -1;
     }
 }
 
-static void process_uart_line(char *buffer)
+/** Check the XOR and remove the checksum before parsing the payload. */
+static bool camera_validate_frame (char * p_frame)
 {
-    int idx = my_strlen(buffer);
+    char * p_checksum = camera_checksum_start(p_frame);
 
-    while (idx > 0 &&
-           (buffer[idx - 1] == '\r' ||
-            buffer[idx - 1] == '\n')) {
-        buffer[--idx] = '\0';
+    if ((p_checksum == NULL) || (p_checksum[1] == '\0') ||
+        (p_checksum[2] == '\0') || (p_checksum[3] != '\0'))
+    {
+        return false;
     }
 
-    if (idx == 0)
+    int high = camera_hex_value(p_checksum[1]);
+    int low  = camera_hex_value(p_checksum[2]);
+
+    if ((high < 0) || (low < 0))
+    {
+        return false;
+    }
+
+    uint8_t expected = 0U;
+
+    for (char * p_byte = p_frame; p_byte < p_checksum; ++p_byte)
+    {
+        /* Convert the UART character back to its unsigned byte value. */
+        expected ^= (uint8_t)*p_byte;
+    }
+
+    if (expected != ((high << 4) | low))
+    {
+        return false;
+    }
+
+    *p_checksum = '\0';
+    return true;
+}
+
+/** Update an object observation while the detection table is locked. */
+static void camera_store_object (marker_reading_t const * p_marker)
+{
+    int id = p_marker->id;
+
+    if ((id <= DIRECTION_MARKER_COUNT) || (id >= MAX_ARUCO_IDS) ||
+        released_object_ids[id])
+    {
         return;
+    }
 
-    char *star = my_strchr(buffer, '*');
-
-    /* Reject bad checksums without logging every dropped frame. */
-    if (star == NULL || my_strlen(star + 1) != 2)
-        return;
-
-    int hi = uart_hex_value(star[1]);
-    int lo = uart_hex_value(star[2]);
-
-    if (hi < 0 || lo < 0)
-        return;
-
-    UB expected = 0;
-
-    for (char *p = buffer; p < star; ++p)
-        expected ^= (UB)*p;
-
-    if (expected != (UB)((hi << 4) | lo))
-        return;
-
-    *star = '\0';
-
-    char *start;
-
-    if ((start = my_strstr(buffer, "A,")) != NULL) {
-        start += 2;
-
-        int id = parse_int(&start);
-        int x = parse_int(&start);
-        int y = parse_int(&start);
-
-        (void)parse_float(&start);
-        float dist = parse_float(&start);
-
-        const char *direction = direction_for_marker(id);
-
-        if (tk_loc_mtx(mtx_id, TMO_FEVR) < E_OK)
+    for (int slot = 0; slot < object_count; ++slot)
+    {
+        if (object_map[slot].id == id)
+        {
+            object_map[slot] = *p_marker;
             return;
-
-        if (direction != NULL) {
-            int slot = id - 1;
-
-            if (!direction_seen[slot]) {
-                direction_seen[slot] = TRUE;
-                direction_count++;
-            }
-
-            direction_map[slot].id = id;
-            direction_map[slot].x = x;
-            direction_map[slot].y = y;
-            direction_map[slot].distance = dist;
-
-        } else if (id >= 4 &&
-                   id < MAX_ARUCO_IDS &&
-                   !released_object_ids[id]) {
-
-            int slot = -1;
-
-            for (int i = 0; i < object_count; ++i) {
-                if (object_map[i].id == id) {
-                    slot = i;
-                    break;
-                }
-            }
-
-            if (slot < 0 && object_count < MAX_OBJECTS) {
-                slot = object_count++;
-                object_map[slot].id = id;
-            }
-
-            if (slot >= 0) {
-                object_map[slot].x = x;
-                object_map[slot].y = y;
-                object_map[slot].distance = dist;
-            }
         }
-
-        (void)tk_unl_mtx(mtx_id);
-        return;
     }
 
-    if ((start = my_strstr(buffer, "C,")) != NULL) {
-        start += 2;
-        char color = *start;
-
-        if (color == 'N') {
-            robot_logf(
-                (UB *)"  -> No recognized payload color\n"
-            );
-        } else if (start[1] == ',') {
-            start += 2;
-
-            int x = parse_int(&start);
-            int y = parse_int(&start);
-
-            robot_logf(
-                (UB *)"  -> Payload found: COLOR %c "
-                       "at X:%d Y:%d\n",
-                color, x, y
-            );
-        } else {
-            robot_logf(
-                (UB *)"[UART RX] malformed color frame\n"
-            );
-        }
-
-        return;
-    }
-
-    robot_logf(
-        (UB *)"[UART RX] valid checksum, unknown frame type\n"
-    );
-}
-
-/* ---------- Camera UART tasks ---------- */
-
-LOCAL void task_uart_tx(INT stacd, void *exinf)
-{
-    ModeCommand command;
-
-    (void)stacd;
-    (void)exinf;
-
-    for (;;) {
-        if (tk_rcv_mbf(
-                command_mbf_id,
-                &command,
-                TMO_FEVR
-            ) == (INT)sizeof(command)) {
-
-            SZ written;
-
-            ER err = tk_swri_dev(
-                uart_device_id,
-                0,
-                command.bytes,
-                sizeof(command.bytes),
-                &written
-            );
-
-            if (err < E_OK) {
-                robot_logf(
-                    (UB *)"[UART] write error %d\n",
-                    err
-                );
-            }
-        }
+    if (object_count < MAX_OBJECTS)
+    {
+        object_map[object_count] = *p_marker;
+        ++object_count;
     }
 }
 
-LOCAL void task_uart_rx(INT stacd, void *exinf)
+/** Parse an ArUco report and publish it to the active scan. */
+static void camera_receive_marker (char * p_field)
 {
-    char buffer[RX_LINE_SIZE];
+    marker_reading_t marker = {0};
+
+    marker.id = camera_parse_integer(&p_field);
+    marker.x  = camera_parse_integer(&p_field);
+    marker.y  = camera_parse_integer(&p_field);
+
+    /* Skip the reported width. Steering uses the following distance. */
+    (void)camera_parse_decimal(&p_field);
+    marker.distance = camera_parse_decimal(&p_field);
+
+    if (tk_loc_mtx(mtx_id, TMO_FEVR) < E_OK)
+    {
+        return;
+    }
+
+    if ((marker.id >= 1) && (marker.id <= DIRECTION_MARKER_COUNT))
+    {
+        int slot = marker.id - 1;
+
+        direction_map[slot]  = marker;
+        direction_seen[slot] = TRUE;
+    }
+    else
+    {
+        camera_store_object(&marker);
+    }
+
+    (void)tk_unl_mtx(mtx_id);
+}
+
+/** Log a color observation from the XIAO. */
+static void camera_receive_color (char * p_field)
+{
+    char color = *p_field;
+
+    if (color == 'N')
+    {
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)"  -> No recognized payload color\n");
+    }
+    else if ((color != '\0') && (p_field[1] == ','))
+    {
+        p_field += 2;
+
+        int position_x = camera_parse_integer(&p_field);
+        int position_y = camera_parse_integer(&p_field);
+
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)"  -> Payload found: COLOR %c at X:%d Y:%d\n",
+                   color, position_x, position_y);
+    }
+    else
+    {
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)"[UART RX] malformed color frame\n");
+    }
+}
+
+/** Dispatch a complete, checksum-verified UART frame. */
+static void camera_receive_frame (char * p_frame)
+{
+    /* Ignore corrupted UART frames without flooding the mission log. */
+    if (!camera_validate_frame(p_frame))
+    {
+        return;
+    }
+
+    if ((p_frame[0] == 'A') && (p_frame[1] == ','))
+    {
+        camera_receive_marker(p_frame + 2);
+    }
+    else if ((p_frame[0] == 'C') && (p_frame[1] == ','))
+    {
+        camera_receive_color(p_frame + 2);
+    }
+    else
+    {
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)
+                   "[UART RX] valid checksum, unknown frame type\n");
+    }
+}
+
+/** Queue the camera's four-byte mode command for the transmit task. */
+static void send_mode_command (char const * p_mode)
+{
+    ModeCommand command = {{0}};
+    UW length = 0U;
+
+    while ((length < sizeof(command.bytes)) && (p_mode[length] != '\0'))
+    {
+        /* The mode command is ASCII and the UART API uses unsigned bytes. */
+        command.bytes[length] = (UB)p_mode[length];
+        ++length;
+    }
+
+    if ((length == 0U) ||
+        (tk_snd_mbf(command_mbf_id, &command, sizeof(command), TMO_FEVR)
+         < E_OK))
+    {
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)"[UART] failed to queue mode command\n");
+    }
+}
+
+/** Own UART writes so mission tasks only enqueue camera commands. */
+static void camera_tx_task (INT start_code, void * p_extension)
+{
+    (void)start_code;
+    (void)p_extension;
+
+    for (;;)
+    {
+        ModeCommand command = {{0}};
+
+        /* The four-byte message fits in the kernel's signed result type. */
+        if (tk_rcv_mbf(command_mbf_id, &command, TMO_FEVR)
+            == (INT)sizeof(command))
+        {
+            SZ written = 0;
+            ER error = tk_swri_dev(uart_device_id, 0, command.bytes,
+                                   sizeof(command.bytes), &written);
+
+            if (error < E_OK)
+            {
+                /* The monitor logger uses kernel byte format strings. */
+                robot_logf((UB const *)"[UART] write error %d\n", error);
+            }
+        }
+    }
+}
+
+/** Print a bounded sample of discarded UART data in hexadecimal. */
+static void camera_log_bytes (char const * p_bytes, uint32_t length)
+{
+    static char const hex[] = "0123456789ABCDEF";
+
+    for (uint32_t index = 0U; index < length; ++index)
+    {
+        /* The unsigned byte is split into two indices from 0 through 15. */
+        uint8_t value = (uint8_t)p_bytes[index];
+
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)" %c%c", hex[value >> 4U], hex[value & 0x0FU]);
+    }
+
+    /* End the byte sample in the monitor. */
+    robot_logf((UB const *)"\n");
+}
+
+/** Keep only the first bytes of a run of UART noise for diagnostics. */
+static void camera_record_noise (camera_rx_state_t * p_state, char byte)
+{
+    if (p_state->noise_length < sizeof(p_state->noise))
+    {
+        p_state->noise[p_state->noise_length] = byte;
+        ++p_state->noise_length;
+    }
+}
+
+/** Append a byte, or drop and report a frame exceeding the receive buffer. */
+static void camera_append_byte (camera_rx_state_t * p_state, char byte)
+{
+    if (p_state->length >= (sizeof(p_state->frame) - 1U))
+    {
+        uint32_t sample_length = sizeof(p_state->noise);
+
+        /* The buffer sample is 16 bytes, which fits the %d argument. */
+        robot_logf((UB const *)"[UART RX] oversized frame; first %d bytes:",
+                   (INT)sample_length);
+        camera_log_bytes(p_state->frame, sample_length);
+        p_state->length = 0U;
+        return;
+    }
+
+    p_state->frame[p_state->length] = byte;
+    ++p_state->length;
+    p_state->frame[p_state->length] = '\0';
+
+    char const * p_checksum = camera_checksum_start(p_state->frame);
+
+    /* Dispatch after two checksum digits even if the newline was lost. */
+    if ((p_checksum != NULL) &&
+        ((p_state->frame + p_state->length) - (p_checksum + 1) == 2))
+    {
+        camera_receive_frame(p_state->frame);
+        p_state->length = 0U;
+    }
+}
+
+/** Assemble ArUco and color frames and recover after a lost separator. */
+static void camera_receive_byte (camera_rx_state_t * p_state, char byte)
+{
+    bool b_is_prefix = (byte == 'A') || (byte == 'C');
+
+    if ((byte == '\r') || (byte == '\n'))
+    {
+        if (p_state->length > 2U)
+        {
+            camera_receive_frame(p_state->frame);
+        }
+
+        p_state->length = 0U;
+        return;
+    }
+
+    if (p_state->length == 0U)
+    {
+        if (b_is_prefix)
+        {
+            p_state->noise_length = 0U;
+            camera_append_byte(p_state, byte);
+        }
+        else
+        {
+            camera_record_noise(p_state, byte);
+            ++p_state->discarded_bytes;
+
+            if ((p_state->discarded_bytes & 127U) == 0U)
+            {
+                /* The monitor uses UW for its unsigned diagnostic counter. */
+                robot_logf((UB const *)
+                           "[UART RX] discarded %u "
+                           "bytes without a frame prefix; sample:",
+                           p_state->discarded_bytes);
+                camera_log_bytes(p_state->noise, p_state->noise_length);
+                p_state->noise_length = 0U;
+            }
+        }
+
+        return;
+    }
+
+    if (p_state->length == 1U)
+    {
+        if (byte == ',')
+        {
+            camera_append_byte(p_state, byte);
+        }
+        else if (b_is_prefix)
+        {
+            p_state->frame[0] = byte;
+        }
+        else
+        {
+            camera_record_noise(p_state, p_state->frame[0]);
+            camera_record_noise(p_state, byte);
+            p_state->length = 0U;
+            ++p_state->discarded_bytes;
+        }
+
+        return;
+    }
+
+    /* A or C inside the payload signals a new frame after a truncated one. */
+    if (b_is_prefix && (camera_checksum_start(p_state->frame) == NULL))
+    {
+        p_state->length = 0U;
+    }
+
+    camera_append_byte(p_state, byte);
+}
+
+/** Poll the kernel UART and feed complete read batches to the frame parser. */
+static void camera_rx_task (INT start_code, void * p_extension)
+{
+    (void)start_code;
+    (void)p_extension;
+
+    camera_rx_state_t state = {0};
     char pending[32];
 
-    SZ pending_size = 0;
-    SZ pending_index = 0;
+    for (;;)
+    {
+        SZ available = 0;
+        ER error = tk_srea_dev(uart_device_id, 0, NULL, 0, &available);
 
-    int index = 0;
-    UW discarded_bytes = 0;
-
-    UB noise_sample[16];
-    INT noise_sample_size = 0;
-
-    (void)stacd;
-    (void)exinf;
-
-    for (;;) {
-        if (pending_index >= pending_size) {
-            SZ available = 0;
-
-            ER err = tk_srea_dev(
-                uart_device_id,
-                0,
-                NULL,
-                0,
-                &available
-            );
-
-            if (err < E_OK || available <= 0) {
-                (void)tk_dly_tsk(1);
-                continue;
-            }
-
-            pending_size =
-                available < (SZ)sizeof(pending)
-                    ? available
-                    : (SZ)sizeof(pending);
-
-            pending_index = 0;
-
-            err = tk_srea_dev(
-                uart_device_id,
-                0,
-                pending,
-                pending_size,
-                &pending_size
-            );
-
-            if (err < E_OK || pending_size <= 0) {
-                pending_size = 0;
-                pending_index = 0;
-                (void)tk_dly_tsk(1);
-                continue;
-            }
+        if ((error < E_OK) || (available <= 0))
+        {
+            (void)tk_dly_tsk(1);
+            continue;
         }
 
-        while (pending_index < pending_size) {
-            char ch = pending[pending_index++];
+        /* The local buffer is 32 bytes, well within the kernel size type. */
+        SZ capacity = (SZ)sizeof(pending);
+        SZ requested = (available < capacity) ? available : capacity;
+        SZ received = 0;
+        error = tk_srea_dev(uart_device_id, 0, pending, requested, &received);
 
-            if (ch == '\r' || ch == '\n') {
-                if (index > 2) {
-                    buffer[index] = '\0';
-                    process_uart_line(buffer);
-                }
+        if ((error < E_OK) || (received <= 0))
+        {
+            (void)tk_dly_tsk(1);
+            continue;
+        }
 
-                index = 0;
-                continue;
-            }
-
-            if (index == 0) {
-                if (ch == 'A' || ch == 'C') {
-                    noise_sample_size = 0;
-                    buffer[index++] = ch;
-                    buffer[index] = '\0';
-                } else {
-                    if (noise_sample_size <
-                        (INT)sizeof(noise_sample)) {
-                        noise_sample[noise_sample_size++] =
-                            (UB)ch;
-                    }
-
-                    discarded_bytes++;
-
-                    if ((discarded_bytes & 127U) == 0U) {
-                        static const char hex[] =
-                            "0123456789ABCDEF";
-
-                        robot_logf(
-                            (UB *)"[UART RX] discarded %u "
-                                   "bytes without a frame prefix; "
-                                   "sample:",
-                            discarded_bytes
-                        );
-
-                        for (INT i = 0;
-                             i < noise_sample_size;
-                             ++i) {
-                            robot_logf(
-                                (UB *)" %c%c",
-                                hex[noise_sample[i] >> 4],
-                                hex[noise_sample[i] & 0x0F]
-                            );
-                        }
-
-                        robot_logf((UB *)"\n");
-                        noise_sample_size = 0;
-                    }
-                }
-
-                continue;
-            }
-
-            if (index == 1) {
-                if (ch == ',') {
-                    buffer[index++] = ch;
-                    buffer[index] = '\0';
-                } else if (ch == 'A' || ch == 'C') {
-                    buffer[0] = ch;
-                } else {
-                    if (noise_sample_size <
-                        (INT)sizeof(noise_sample)) {
-                        noise_sample[noise_sample_size++] =
-                            (UB)buffer[0];
-
-                        if (noise_sample_size <
-                            (INT)sizeof(noise_sample)) {
-                            noise_sample[noise_sample_size++] =
-                                (UB)ch;
-                        }
-                    }
-
-                    index = 0;
-                    discarded_bytes++;
-                }
-
-                continue;
-            }
-
-            if (my_strchr(buffer, '*') == NULL &&
-                (ch == 'A' || ch == 'C')) {
-
-                buffer[0] = ch;
-                buffer[1] = '\0';
-                index = 1;
-                continue;
-            }
-
-            if (index < RX_LINE_SIZE - 1) {
-                buffer[index++] = ch;
-                buffer[index] = '\0';
-
-                char *star = my_strchr(buffer, '*');
-
-                if (star != NULL &&
-                    (SZ)(buffer + index - (star + 1)) == 2) {
-
-                    process_uart_line(buffer);
-                    index = 0;
-                }
-            } else {
-                static const char hex[] =
-                    "0123456789ABCDEF";
-
-                int sample = index < 16 ? index : 16;
-
-                robot_logf(
-                    (UB *)"[UART RX] oversized frame; "
-                           "first %d bytes:",
-                    sample
-                );
-
-                for (int i = 0; i < sample; ++i) {
-                    UB value = (UB)buffer[i];
-
-                    robot_logf(
-                        (UB *)" %c%c",
-                        hex[value >> 4],
-                        hex[value & 0x0F]
-                    );
-                }
-
-                robot_logf((UB *)"\n");
-                index = 0;
-            }
+        for (SZ index = 0; index < received; ++index)
+        {
+            camera_receive_byte(&state, pending[index]);
         }
     }
 }
@@ -1610,7 +1619,6 @@ static void clear_scan_results(void)
         return;
 
     object_count = 0;
-    direction_count = 0;
 
     for (int i = 0; i < DIRECTION_MARKER_COUNT; ++i)
         direction_seen[i] = FALSE;
@@ -1852,103 +1860,195 @@ static BOOL turn_to_scan_heading(float target_yaw, INT sweep_direction)
     return drive_turn_degrees_with_speed(degrees, TRUE);
 }
 
-/* GCC math built-ins avoid newlib's conflicting size_t declaration. */
-static float wrap_bearing_deg(float degrees)
+/** Wrap a bearing to one clockwise revolution. */
+static float32_t wrap_bearing_deg (float32_t degrees)
 {
-    float wrapped = __builtin_fmodf(degrees, 360.0f);
-    return wrapped < 0.0f ? wrapped + 360.0f : wrapped;
+    float32_t const full_turn_deg = (float32_t)g_full_turn_deg;
+    float32_t const wrapped = fmodf(degrees, full_turn_deg);
+
+    return (wrapped < 0.0f) ? (wrapped + full_turn_deg) : wrapped;
 }
 
-static BOOL read_direction_map_yaw(float *yaw_deg)
+/** Get a usable gyro heading before recording or using the startup map. */
+static bool read_direction_map_yaw (float32_t * p_yaw_deg)
 {
     imu_heading_reading_t reading = {0};
     imu_heading_read(&reading);
-    if (!mission_imu_healthy(&reading)) {
+
+    if ((!mission_imu_healthy(&reading)) || (!isfinite(reading.relative_deg)))
+    {
         mission_latch_stop("Gyro unavailable for direction bearings");
         mission_checkpoint();
-        return FALSE;
+        return false;
     }
 
-    *yaw_deg = reading.relative_deg;
-    return TRUE;
+    *p_yaw_deg = reading.relative_deg;
+    return true;
 }
 
-static BOOL map_direction_markers_at_startup(void)
+/** Keep the most centred observation and its distance for each marker. */
+static void update_startup_bearings (float32_t camera_bearing_deg)
+{
+    for (int32_t marker_id = 1; marker_id <= DIRECTION_MARKER_COUNT;
+         ++marker_id)
+    {
+        marker_reading_t marker = {0};
+
+        /* A displayed distance must fit the console's signed integer field. */
+        if ((!read_direction(marker_id, &marker)) ||
+            (!isfinite(marker.distance)) || (marker.distance <= 0.0f) ||
+            (marker.distance >= (float32_t)INT32_MAX) ||
+            (marker.x < 0) || (marker.x >= CAMERA_FRAME_WIDTH_PX))
+        {
+            continue;
+        }
+
+        int32_t const offset_px = marker.x - CAMERA_CENTER_X;
+        int32_t const center_error_px =
+            (offset_px < 0) ? -offset_px : offset_px;
+        direction_bearing_t * const p_entry =
+            &g_startup_bearings[marker_id - 1];
+
+        if (p_entry->b_is_mapped &&
+            (center_error_px >= p_entry->center_error_px))
+        {
+            continue;
+        }
+
+        /* Image offset is relative to the stopped camera heading. */
+        float32_t const image_angle_deg =
+            atanf((float32_t)offset_px / CAMERA_FOCAL_LENGTH_PX) *
+            g_degrees_per_radian;
+        float32_t const bearing_deg =
+            wrap_bearing_deg(camera_bearing_deg + image_angle_deg);
+
+        if (!isfinite(bearing_deg))
+        {
+            continue;
+        }
+
+        p_entry->bearing_deg      = bearing_deg;
+        p_entry->distance_mm      = marker.distance;
+        p_entry->center_error_px  = center_error_px;
+        p_entry->b_is_mapped      = true;
+    }
+}
+
+/** Report the accepted startup map once before the first pickup. */
+static void log_startup_direction_map (void)
+{
+    robot_logf((UB const *)"[map] bearings relative to startup; "
+                           "right positive\n");
+
+    for (int32_t marker_id = 1; marker_id <= DIRECTION_MARKER_COUNT;
+         ++marker_id)
+    {
+        direction_bearing_t const * const p_entry =
+            &g_startup_bearings[marker_id - 1];
+        char const * const p_name = direction_for_marker(marker_id);
+
+        if (!p_entry->b_is_mapped)
+        {
+            robot_logf((UB const *)"[map] ID:%d %s missing\n",
+                       (INT)marker_id, p_name);
+        }
+        else
+        {
+            int32_t const distance_mm = (int32_t)(p_entry->distance_mm + 0.5f);
+            int32_t const bearing_cd =
+                (int32_t)(p_entry->bearing_deg *
+                          (float32_t)g_centidegrees_per_degree);
+
+            robot_logf((UB const *)"[map] ID:%d %s distance=%d mm "
+                                   "bearing=%d.%02d deg\n",
+                       (INT)marker_id, p_name, (INT)distance_mm,
+                       (INT)(bearing_cd / g_centidegrees_per_degree),
+                       (INT)(bearing_cd % g_centidegrees_per_degree));
+        }
+    }
+}
+
+/** Sweep once and verify that the mission has enough direction markers. */
+static bool map_direction_markers_at_startup (void)
 {
     drive_stop();
-    if (!read_direction_map_yaw(&startup_map_yaw_deg))
-        return FALSE;
 
-    robot_logf((UB *)"[map] starting 360-degree direction sweep\n");
-    for (INT angle = 0; angle < 360; angle += DIRECTION_MAP_STEP_DEG) {
-        if (angle > 0 &&
-            !turn_to_scan_heading(
-                startup_map_yaw_deg + (float)angle * TURN_GYRO_RIGHT_SIGN, 1))
-            return FALSE;
-
-        robot_logf((UB *)"[map] scanning at %d degrees\n", angle);
-        if (!collect_marker_scan(FALSE, DIRECTION_SCAN_WINDOW_MS))
-            return FALSE;
-
-        float yaw_deg;
-        if (!read_direction_map_yaw(&yaw_deg))
-            return FALSE;
-        float camera_bearing_deg =
-            (yaw_deg - startup_map_yaw_deg) * TURN_GYRO_RIGHT_SIGN;
-
-        for (INT id = 1; id <= DIRECTION_MARKER_COUNT; ++id) {
-            marker_reading_t marker = {0};
-            if (!read_direction(id, &marker) || !(marker.distance > 0.0f) ||
-                marker.x < 0 || marker.x >= CAMERA_FRAME_WIDTH_PX)
-                continue;
-
-            INT offset_px = marker.x - CAMERA_CENTER_X;
-            INT center_error_px = offset_px < 0 ? -offset_px : offset_px;
-            direction_bearing_t *entry = &startup_bearings[id - 1];
-            if (entry->mapped && center_error_px >= entry->center_error_px)
-                continue;
-
-            /* Image offset is measured relative to the stopped camera heading. */
-            float image_angle_deg =
-                __builtin_atanf((float)offset_px / CAMERA_FOCAL_LENGTH_PX) *
-                57.2957795f;
-            entry->bearing_deg = wrap_bearing_deg(
-                camera_bearing_deg + image_angle_deg);
-            entry->center_error_px = center_error_px;
-            entry->mapped = TRUE;
-        }
+    if (!read_direction_map_yaw(&g_startup_map_yaw_deg))
+    {
+        return false;
     }
 
-    /* The last step completes the revolution without scanning the origin twice. */
-    if (!turn_to_scan_heading(
-            startup_map_yaw_deg + 360.0f * TURN_GYRO_RIGHT_SIGN, 1))
-        return FALSE;
+    robot_logf((UB const *)"[map] starting 360-degree direction sweep\n");
+
+    for (int32_t angle = 0; angle < g_full_turn_deg;
+         angle += DIRECTION_MAP_STEP_DEG)
+    {
+        float32_t const scan_yaw_deg =
+            g_startup_map_yaw_deg + ((float32_t)angle * TURN_GYRO_RIGHT_SIGN);
+
+        if ((angle > 0) && (FALSE == turn_to_scan_heading(scan_yaw_deg, 1)))
+        {
+            return false;
+        }
+
+        robot_logf((UB const *)"[map] scanning at %d degrees\n", (INT)angle);
+
+        if (FALSE == collect_marker_scan(FALSE, DIRECTION_SCAN_WINDOW_MS))
+        {
+            return false;
+        }
+
+        float32_t yaw_deg = 0.0f;
+
+        if (!read_direction_map_yaw(&yaw_deg))
+        {
+            return false;
+        }
+
+        float32_t const camera_bearing_deg =
+            (yaw_deg - g_startup_map_yaw_deg) * TURN_GYRO_RIGHT_SIGN;
+
+        update_startup_bearings(camera_bearing_deg);
+    }
+
+    /* Complete the revolution without scanning the origin twice. */
+    float32_t const end_yaw_deg = g_startup_map_yaw_deg +
+        ((float32_t)g_full_turn_deg * TURN_GYRO_RIGHT_SIGN);
+
+    if (FALSE == turn_to_scan_heading(end_yaw_deg, 1))
+    {
+        return false;
+    }
+
     drive_stop();
 
-    INT mapped_count = 0;
-    for (INT id = 1; id <= DIRECTION_MARKER_COUNT; ++id) {
-        const direction_bearing_t *entry = &startup_bearings[id - 1];
-        if (entry->mapped) {
+    int32_t mapped_count = 0;
+
+    for (int32_t idx = 0; idx < DIRECTION_MARKER_COUNT; ++idx)
+    {
+        if (g_startup_bearings[idx].b_is_mapped)
+        {
             ++mapped_count;
-            robot_logf((UB *)"[map] ID:%d %s bearing_cd=%d (right positive)\n",
-                       id, direction_for_marker(id),
-                       (INT)(entry->bearing_deg * 100.0f));
-        } else {
-            robot_logf((UB *)"[map] ID:%d %s missing\n",
-                       id, direction_for_marker(id));
         }
     }
 
-    INT required_count = DIRECTION_MAP_REQUIRE_ALL ? DIRECTION_MARKER_COUNT : 1;
-    robot_logf((UB *)"[map] sweep complete; mapped %d/%d; require %d\n",
-               mapped_count, DIRECTION_MARKER_COUNT, required_count);
-    if (mapped_count < required_count) {
+    int32_t const required_count =
+        (0 != DIRECTION_MAP_REQUIRE_ALL) ? DIRECTION_MARKER_COUNT : 1;
+
+    robot_logf((UB const *)"[map] sweep complete; mapped %d/%d; require %d\n",
+               (INT)mapped_count, (INT)DIRECTION_MARKER_COUNT,
+               (INT)required_count);
+
+    if (mapped_count < required_count)
+    {
         mission_latch_stop("Not enough direction markers mapped");
         mission_checkpoint();
-        return FALSE;
+        return false;
     }
 
-    return TRUE;
+    log_startup_direction_map();
+
+    return true;
 }
 
 static BOOL find_delivery_marker(marker_reading_t *target)
@@ -1957,22 +2057,24 @@ static BOOL find_delivery_marker(marker_reading_t *target)
 
     for (;;) {
         mission_checkpoint();
-        float yaw_deg;
+        float32_t yaw_deg = 0.0f;
         if (!read_direction_map_yaw(&yaw_deg))
             return FALSE;
 
-        float current_bearing_deg = wrap_bearing_deg(
-            (yaw_deg - startup_map_yaw_deg) * TURN_GYRO_RIGHT_SIGN);
+        float32_t const current_bearing_deg = wrap_bearing_deg(
+            (yaw_deg - g_startup_map_yaw_deg) * TURN_GYRO_RIGHT_SIGN);
         INT best_id = 0;
         float best_turn_deg = 0.0f;
         float smallest_turn_deg = 181.0f;
 
         for (INT i = 0; i < DIRECTION_MARKER_COUNT; ++i) {
-            if (!startup_bearings[i].mapped || tried[i])
+            if ((!g_startup_bearings[i].b_is_mapped) || tried[i])
+            {
                 continue;
+            }
 
             float turn_deg = wrap_bearing_deg(
-                startup_bearings[i].bearing_deg - current_bearing_deg);
+                g_startup_bearings[i].bearing_deg - current_bearing_deg);
             if (turn_deg > 180.0f)
                 turn_deg -= 360.0f;
             float turn_size_deg = __builtin_fabsf(turn_deg);
@@ -1986,9 +2088,14 @@ static BOOL find_delivery_marker(marker_reading_t *target)
             break;
 
         tried[best_id - 1] = TRUE;
-        robot_logf((UB *)"[map aim] ID:%d bearing_cd=%d turn_cd=%d\n",
-                   best_id, (INT)(startup_bearings[best_id - 1].bearing_deg * 100.0f),
-                   (INT)(best_turn_deg * 100.0f));
+        float32_t const centidegrees_per_degree =
+            (float32_t)g_centidegrees_per_degree;
+        float32_t const best_bearing_deg =
+            g_startup_bearings[best_id - 1].bearing_deg;
+
+        robot_logf((UB const *)"[map aim] ID:%d bearing_cd=%d turn_cd=%d\n",
+                   best_id, (INT)(best_bearing_deg * centidegrees_per_degree),
+                   (INT)(best_turn_deg * centidegrees_per_degree));
         if (!drive_turn_degrees(best_turn_deg))
             return FALSE;
 
@@ -2331,186 +2438,234 @@ static BOOL align_direction_marker(INT marker_id)
     return FALSE;
 }
 
+/* ---------- Mission task ---------- */
+
+#define MISSION_ANY_OBJECT_ID         0
+#define MISSION_GRIPPER_SETTLE_MS     400U
+#define MISSION_RETRY_DELAY_MS        1000U
+#define MISSION_NEXT_CYCLE_DELAY_MS   1000U
+
+typedef enum
+{
+    MISSION_MAP_DIRECTIONS,
+    MISSION_BEGIN_PICKUP,
+    MISSION_APPROACH_OBJECT,
+    MISSION_DELIVER_USING_MAP,
+    MISSION_DELIVER_USING_LIVE_SCAN,
+    MISSION_RELEASE_OBJECT,
+    MISSION_COMPLETE_CYCLE,
+    MISSION_FINISHED
+} mission_state_t;
+
+typedef struct
+{
+    /* Keep the kernel BOOL required by approach_marker(). */
+    BOOL gripper_opened;
+    INT  object_id;
+    INT  direction_id;
+} mission_cycle_t;
+
 /* ---------- Operator CLI (components/cli + cli_bridge.c) ---------- */
 
 #include "cli_bridge.c"
 
-/* ---------- Mission task ---------- */
-
-LOCAL void task_state_machine(INT stacd, void *exinf)
+/** Build the direction map once before starting the pickup cycles. */
+static mission_state_t mission_map_directions (void)
 {
-    (void)stacd;
-    (void)exinf;
+    if (!map_direction_markers_at_startup())
+    {
+        mission_latch_stop("Direction mapping failed");
+        return MISSION_FINISHED;
+    }
+
+    robot_logf((UB *)"[mission] ENABLED: direction map ready; "
+                     "starting pickups.\n");
+
+    return MISSION_BEGIN_PICKUP;
+}
+
+/** Reset the pickup data once per cycle, keeping it across retries. */
+static void mission_begin_pickup (mission_cycle_t * p_cycle)
+{
+    mission_checkpoint();
+    cli_bridge_set_phase(PHASE_SEARCH, 0);
+    robot_logf((UB *)"\n[mission] starting cycle; "
+                     "looking for object ArUco IDs 4 and above\n");
+    robot_logf((UB *)"[gripper] signal idle; "
+                     "waiting for an object marker\n");
+
+    p_cycle->gripper_opened = FALSE;
+    p_cycle->object_id = MISSION_ANY_OBJECT_ID;
+}
+
+/** Run an object approach and close the gripper once it reaches the block. */
+static mission_state_t mission_pick_up_object (mission_cycle_t * p_cycle)
+{
+    bool const b_reached = (FALSE != approach_marker(MISSION_ANY_OBJECT_ID,
+                                                     OBJECT_STANDOFF_MM,
+                                                     &p_cycle->gripper_opened,
+                                                     &p_cycle->object_id));
+    mission_checkpoint();
+
+    if (!b_reached)
+    {
+        robot_logf((UB *)"[mission] no object reached; "
+                         "restarting 15-degree search\n");
+        (void)tk_dly_tsk(MISSION_RETRY_DELAY_MS);
+        return MISSION_APPROACH_OBJECT;
+    }
+
+    cli_bridge_set_phase(PHASE_GRIP, p_cycle->object_id);
+    robot_logf((UB *)"[mission] object reached; closing gripper\n");
+    claw_close();
+    robot_logf((UB *)"[gripper] holding at %d degrees\n", claw_get_angle());
+    (void)tk_dly_tsk(MISSION_GRIPPER_SETTLE_MS);
+    mission_checkpoint();
+
+    return MISSION_DELIVER_USING_MAP;
+}
+
+/** Align with the chosen direction marker before driving toward it. */
+static bool mission_approach_direction (marker_reading_t const * p_direction)
+{
+    char const * const p_name = direction_for_marker(p_direction->id);
+
+    robot_logf((UB *)"[mission] selected direction: %s (ID:%d, %d mm)\n",
+               p_name,
+               p_direction->id,
+               (INT)(p_direction->distance + 0.5f));
+
+    if (!align_direction_marker(p_direction->id))
+    {
+        return false;
+    }
+
+    robot_logf((UB *)"[mission] driving toward %s marker\n", p_name);
+
+    return (FALSE != approach_marker(p_direction->id,
+                                     DIRECTION_STANDOFF_MM, NULL, NULL));
+}
+
+/** Deliver using the saved map first, then use live detections on retries. */
+static mission_state_t mission_deliver_object (mission_cycle_t * p_cycle,
+                                               bool b_search_live)
+{
+    marker_reading_t direction = {0};
+    cli_bridge_set_phase(PHASE_DELIVER, p_cycle->object_id);
+    bool const b_found = b_search_live
+        ? (FALSE != find_marker(FALSE, &direction))
+        : (FALSE != find_delivery_marker(&direction));
+
+    if (!b_found)
+    {
+        mission_latch_stop("No direction marker found");
+        return MISSION_FINISHED;
+    }
+
+    if (mission_approach_direction(&direction))
+    {
+        p_cycle->direction_id = direction.id;
+        return MISSION_RELEASE_OBJECT;
+    }
+
+    drive_stop();
+    mission_checkpoint();
+    robot_logf((UB *)"[mission] stopped before reaching direction marker; "
+                     "searching for any direction marker\n");
+    (void)tk_dly_tsk(MISSION_RETRY_DELAY_MS);
+
+    return MISSION_DELIVER_USING_LIVE_SCAN;
+}
+
+/** Release the object, record its ID, and back away from the wall. */
+static void mission_release_object (mission_cycle_t const * p_cycle)
+{
+    mission_checkpoint();
+
+    char const * const p_name = direction_for_marker(p_cycle->direction_id);
+    robot_logf((UB *)"[mission] reached %s marker; releasing object ID:%d\n",
+               p_name,
+               p_cycle->object_id);
+
+    claw_open();
+    robot_logf((UB *)"[gripper] release setpoint %d degrees\n",
+               claw_get_angle());
+    (void)tk_dly_tsk(MISSION_GRIPPER_SETTLE_MS);
+    claw_release();
+    mission_checkpoint();
+
+    mark_object_released(p_cycle->object_id);
+    cli_bridge_delivered(p_cycle->object_id);
+    robot_logf((UB *)"[mission] reversing away from delivery point\n");
+    drive_pulse(-CAR_DRIVE_SPEED, -CAR_DRIVE_SPEED,
+                REVERSE_AFTER_RELEASE_MS, NULL);
+    drive_stop();
+}
+
+/** Confirm the retreat has ended before starting another pickup. */
+static void mission_complete_cycle (void)
+{
+    drive_stop();
+    mission_checkpoint();
+    robot_logf((UB *)"[mission] cycle complete; starting next object scan\n");
+    (void)tk_dly_tsk(MISSION_NEXT_CYCLE_DELAY_MS);
+}
+
+/** Run the Pico mission on its existing kernel task. */
+static void mission_task (INT start_code, void * p_extension)
+{
+    (void)start_code;
+    (void)p_extension;
+
+    mission_state_t state = MISSION_MAP_DIRECTIONS;
+    mission_cycle_t cycle = {0};
 
     cli_bridge_wait_for_start();
 
-    /* A task must not return here: its return address is 0. Park instead,
-       so the operator can 'reset'. */
-    if (!map_direction_markers_at_startup()) {
-        mission_latch_stop("Direction mapping failed");
-        mission_park();
+    while (MISSION_FINISHED != state)
+    {
+        switch (state)
+        {
+            case MISSION_MAP_DIRECTIONS:
+                state = mission_map_directions();
+            break;
+
+            case MISSION_BEGIN_PICKUP:
+                mission_begin_pickup(&cycle);
+                state = MISSION_APPROACH_OBJECT;
+            break;
+
+            case MISSION_APPROACH_OBJECT:
+                state = mission_pick_up_object(&cycle);
+            break;
+
+            case MISSION_DELIVER_USING_MAP:
+            case MISSION_DELIVER_USING_LIVE_SCAN:
+                state = mission_deliver_object(
+                    &cycle, (MISSION_DELIVER_USING_LIVE_SCAN == state));
+            break;
+
+            case MISSION_RELEASE_OBJECT:
+                mission_release_object(&cycle);
+                state = MISSION_COMPLETE_CYCLE;
+            break;
+
+            case MISSION_COMPLETE_CYCLE:
+                mission_complete_cycle();
+                state = MISSION_BEGIN_PICKUP;
+            break;
+
+            default:
+                mission_latch_stop("Invalid mission state");
+                mission_checkpoint();
+                state = MISSION_FINISHED;
+            break;
+        }
     }
 
-    robot_logf((UB *)"[mission] ENABLED: direction map ready; starting pickups.\n");
-
-    for (;;) {
-        mission_checkpoint();
-        cli_bridge_set_phase(PHASE_SEARCH, 0);
-
-        robot_logf(
-            (UB *)"\n[mission] starting cycle; "
-                   "looking for object ArUco IDs 4 and above\n"
-        );
-
-        robot_logf(
-            (UB *)"[gripper] signal idle; "
-                   "waiting for an object marker\n"
-        );
-
-        BOOL gripper_opened = FALSE;
-        INT delivered_object_id = 0;
-
-        while (!approach_marker(
-                    0,
-                    OBJECT_STANDOFF_MM,
-                    &gripper_opened,
-                    &delivered_object_id)) {
-
-            mission_checkpoint();
-
-            robot_logf(
-                (UB *)"[mission] no object reached; "
-                       "restarting 15-degree search\n"
-            );
-
-            (void)tk_dly_tsk(1000);
-        }
-
-        mission_checkpoint();
-
-        cli_bridge_set_phase(PHASE_GRIP, delivered_object_id);
-
-        robot_logf(
-            (UB *)"[mission] object reached; "
-                   "closing gripper\n"
-        );
-
-        claw_close();
-
-        robot_logf(
-            (UB *)"[gripper] holding at %d degrees\n",
-            claw_get_angle()
-        );
-
-        (void)tk_dly_tsk(400);
-        mission_checkpoint();
-
-        cli_bridge_set_phase(PHASE_DELIVER, delivered_object_id);
-
-        BOOL search_any_direction = FALSE;
-        for (;;) {
-            marker_reading_t chosen_direction = {0};
-            BOOL found_direction = search_any_direction
-                ? find_marker(FALSE, &chosen_direction)
-                : find_delivery_marker(&chosen_direction);
-            if (!found_direction) {
-                mission_latch_stop("No direction marker found");
-                mission_park();
-            }
-
-            const char *direction_name =
-                direction_for_marker(chosen_direction.id);
-
-            robot_logf(
-                (UB *)"[mission] selected direction: %s "
-                       "(ID:%d, %d mm)\n",
-                direction_name,
-                chosen_direction.id,
-                (INT)(chosen_direction.distance + 0.5f)
-            );
-
-            BOOL aligned =
-                align_direction_marker(chosen_direction.id);
-
-            if (aligned) {
-                robot_logf(
-                    (UB *)"[mission] driving toward "
-                           "%s marker\n",
-                    direction_name
-                );
-            }
-
-            if (aligned &&
-                approach_marker(
-                    chosen_direction.id,
-                    DIRECTION_STANDOFF_MM,
-                    NULL,
-                    NULL)) {
-
-                mission_checkpoint();
-
-                robot_logf(
-                    (UB *)"[mission] reached %s marker; "
-                           "releasing object ID:%d\n",
-                    direction_name,
-                    delivered_object_id
-                );
-
-                claw_open();
-
-                robot_logf(
-                    (UB *)"[gripper] release setpoint "
-                           "%d degrees\n",
-                    claw_get_angle()
-                );
-
-                (void)tk_dly_tsk(400);
-                claw_release();
-
-                mission_checkpoint();
-
-                mark_object_released(delivered_object_id);
-                cli_bridge_delivered(delivered_object_id);
-
-                robot_logf(
-                    (UB *)"[mission] reversing away "
-                           "from delivery point\n"
-                );
-
-                drive_pulse(
-                    -CAR_DRIVE_SPEED,
-                    -CAR_DRIVE_SPEED,
-                    REVERSE_AFTER_RELEASE_MS,
-                    NULL
-                );
-
-                drive_stop();
-                break;
-            }
-
-            drive_stop();
-            mission_checkpoint();
-
-            /* Search live detections instead of reusing the saved aim. */
-            search_any_direction = TRUE;
-            robot_logf(
-                (UB *)"[mission] stopped before reaching "
-                       "direction marker; searching for any direction marker\n"
-            );
-
-            (void)tk_dly_tsk(1000);
-        }
-
-        drive_stop();
-        mission_checkpoint();
-
-        robot_logf(
-            (UB *)"[mission] cycle complete; "
-                   "starting next object scan\n"
-        );
-
-        (void)tk_dly_tsk(1000);
-    }
+    /* A task must not return: its return address is 0.  Park instead, so the
+       operator can 'reset'. */
+    mission_park();
 }
 
 /* ---------- Startup ---------- */

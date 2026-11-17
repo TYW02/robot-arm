@@ -104,6 +104,13 @@ EXPORT void startup_clock(ATR clkatr)
 
 	out_w(CLK_REF+CLK_x_DIV, div);
 
+	/* Microsecond tick for the TIMER peripheral.  The Pico SDK always sets
+	 * this (watchdog_start_tick) to one tick per XOSC_MHz cycles of clk_ref.
+	 * It was never set here, so the timer ran on whatever the boot ROM had
+	 * left, which can differ between a cold power-up and a run after a
+	 * flash.  Set it explicitly: CYCLES = XOSC_MHz (1 us), ENABLE = bit 9. */
+	out_w(0x4005802C, (UW)XOSC_MHz | (1U << 9));
+
 	/* CLK SYS settings */
 	div = (TMCLK_MHz << 8) / TMCLK_MHz;
 	if (div > in_w(CLK_SYS+CLK_x_DIV)) out_w(CLK_SYS+CLK_x_DIV, div);

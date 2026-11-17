@@ -14,6 +14,20 @@ TEMP_DEPS = $(TEMP_SRCS:.c=.d)
 OBJS += $(subst ../, ./mtkernel_3/, $(TEMP_OBJS))
 C_DEPS += $(subst ../, ./mtkernel_3/, $(TEMP_DEPS))
 
+ifneq ($(CLAW_TEST),1)
+# Compile the IMU module directly. The old wrapper may have stale dependencies.
+IMU_HEADING_SRC := ../../../components/imu/imu_heading.c
+IMU_HEADING_OBJ := mtkernel_3/app_program/imu_heading.o
+OBJS += $(IMU_HEADING_OBJ)
+C_DEPS += $(IMU_HEADING_OBJ:.o=.d)
+
+$(IMU_HEADING_OBJ): $(IMU_HEADING_SRC)
+	@echo 'Building file: $<'
+	$(GCC) $(CFLAGS) -D$(TARGET) $(INCPATH) -MF"$(@:%.o=%.d)" -MT"$@" -c -o "$@" "$<"
+	@echo 'Finished building: $<'
+	@echo ' '
+endif
+
 mtkernel_3/app_program/%.o: ../app_program/%.c
 	@echo 'Building file: $<'
 	$(GCC) $(CFLAGS) -D$(TARGET) $(INCPATH) -MF"$(@:%.o=%.d)" -MT"$(@)" -c -o "$@" "$<"

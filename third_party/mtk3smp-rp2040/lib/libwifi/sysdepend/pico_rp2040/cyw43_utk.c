@@ -665,6 +665,11 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
     (void)exinf;
     radio_status.owner_prc = (uint32_t)CYW43_THIS_PRC();
 
+    /* Let the supply settle before the radio starts.  On a power bank or
+     * battery the Wi-Fi chip's first scan and join can fail if it starts the
+     * instant the Pico powers up. */
+    (void)tk_dly_tsk(2000);
+
 #if TM_WIFI_NETIF
     lwip_init();
     radio_status.lwip_initialized = 1;
@@ -673,6 +678,11 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
     cyw43_thread_enter();
     cyw43_wifi_set_up(&cyw43_state, CYW43_ITF_STA, true,
                       CYW43_COUNTRY_WORLDWIDE);
+    /* The SDK's own start-up code turns the chip's power-saving mode off.
+     * This port starts the chip directly and never did, so it ran with the
+     * power-up default, which can stall joins and DHCP replies.  Turn
+     * power-saving off, as the SDK does. */
+    (void)cyw43_wifi_pm(&cyw43_state, CYW43_DEFAULT_PM);
     if((cyw43_state.itf_state & (1u << CYW43_ITF_STA)) == 0) {
         /* cyw43_wifi_set_up() has a void API and otherwise hides its bus-init
          * error.  Report the underlying I/O class instead of letting scan()
@@ -681,8 +691,16 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
     } else {
         (void)cyw43_wifi_get_mac(&cyw43_state, CYW43_ITF_STA,
                                  radio_status.mac);
+#if TM_WIFI_JOIN
+        /* The stock SDK joins directly.  Scanning first and joining the
+         * instant the scan ends made cold starts fail to join, so no boot
+         * scan is run when joining is enabled.  The join is started below. */
+        (void)options;
+        result = 0;
+#else
         result = cyw43_wifi_scan(&cyw43_state, &options, &radio_status,
                                  scan_result);
+#endif
     }
     cyw43_thread_exit();
 
@@ -699,7 +717,11 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
 
     radio_status.init_result = result;
     radio_status.ready = (result == 0);
+#if TM_WIFI_JOIN
+    radio_status.scan_active = 0;
+#else
     radio_status.scan_active = (result == 0);
+#endif
     mp_memory_barrir();
     radio_status.init_complete = 1;
 
@@ -758,6 +780,9 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
 #endif
         radio_status.poll_count++;
         radio_status.scan_active = cyw43_wifi_scan_active(&cyw43_state);
+#if TM_WIFI_JOIN
+        if(!radio_status.join_started) was_scanning = 1;
+#endif
         if(was_scanning && !radio_status.scan_active) {
             mp_memory_barrir();
             radio_status.scan_complete = 1;
@@ -828,15 +853,53 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
                     (int)radio_status.join_result, join_attempts,
                     (int)radio_status.strongest_rssi);
             }
+            /* Rejoin also when the link was up and then dropped.  Before, only
+             * a join that returned an error was retried, so a hotspot that
+             * dropped the Pico left it offline until the next reboot. */
+#if TM_WIFI_DHCP
+            {
+                /* A cold power-up often leaves the Wi-Fi chip unable to join,
+                 * while a restart without power loss joins at once.  If a
+                 * cold start still has no IP address after 45 s, restart the
+                 * Pico once.  The restart is a watchdog reset, so the second
+                 * boot is not a cold start and cannot restart again. */
+                static int cold_restart_done;
+                volatile uint32_t *chip_reset = (volatile uint32_t *)0x40064008;
+                volatile uint32_t *wd_reason = (volatile uint32_t *)0x40058008;
+                int cold = ((*chip_reset & (1u << 8)) != 0u)
+                           && ((*wd_reason & 3u) == 0u);
+
+                if(cold && !cold_restart_done
+                   && !(radio_status.dhcp_complete
+                        && radio_status.dhcp_result == ERR_OK)
+                   && t >= 45000000ULL) {
+                    cold_restart_done = 1;
+                    tm_printf((const unsigned char*)
+                        "[wifi] no IP after 45 s on a cold start, restarting once\n");
+                    (void)tk_dly_tsk(200);
+                    *(volatile uint32_t *)0x40058000 = (1u << 31);
+                }
+            }
+#endif
             if(radio_status.join_started && radio_status.join_complete
-               && radio_status.join_result != 0 && !radio_status.link_up) {
+               && !radio_status.link_up) {
                 if(retry_at_us == 0) {
                     retry_at_us = t + 5000000ULL;
                 } else if(t >= retry_at_us) {
                     retry_at_us = 0;
                     join_attempts++;
+                    tm_printf((const unsigned char*)
+                        "[wifi] link lost or join failed, rejoining (attempt %u)\n",
+                        join_attempts);
+#if TM_WIFI_DHCP
+                    dhcp_started_us = 0;
+                    radio_status.dhcp_complete = 0;
+                    radio_status.dhcp_result = -5;
+#endif
                     radio_status.join_complete = 0;
                     join_started_us = t;
+                    /* Clear any half-finished association first. */
+                    (void)cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
                     result = cyw43_wifi_join(&cyw43_state,
                                              sizeof(wifi_ssid) - 1, wifi_ssid,
                                              sizeof(wifi_password) - 1,
@@ -852,6 +915,28 @@ void cyw43_utk_task(int32_t stacd, void *exinf)
         }
 #endif
         status_publish_end();
+        {
+            /* On-board LED shows the Wi-Fi stage with no console attached:
+             *   slow blink (1 Hz)  scanning / joining the hotspot
+             *   fast blink (5 Hz)  joined, waiting for an IP address
+             *   solid on           got an IP address, ready for commands */
+            static int led_state = -1;
+            uint32_t ms = (uint32_t)(time_us_64() / 1000ULL);
+            int want;
+
+            if(radio_status.dhcp_complete
+               && radio_status.dhcp_result == ERR_OK) {
+                want = 1;
+            } else if(radio_status.link_up) {
+                want = (int)((ms / 100U) & 1U);
+            } else {
+                want = (int)((ms / 500U) & 1U);
+            }
+            if(want != led_state) {
+                led_state = want;
+                cyw43_gpio_set(&cyw43_state, 0, want != 0);
+            }
+        }
         cyw43_utk_poll_requested = 0;
         cyw43_thread_exit();
         (void)tk_dly_tsk(CYW43_POLL_MS);
