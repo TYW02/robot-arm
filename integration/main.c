@@ -1,3 +1,7 @@
+/* Use the standard size_t required by the math and kernel headers. */
+#define PROHIBIT_DEF_SIZE_T
+
+#include <stddef.h>
 #include <tk/tkernel.h>
 #include <tm/tmonitor.h>
 #include <tk/smp.h>
@@ -7,6 +11,8 @@
 #include "../components/drive/claw.h"
 #include "../components/drive/drive_turn.h"
 
+#include <float.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -116,10 +122,17 @@ typedef struct {
     float distance;
 } marker_reading_t;
 
-typedef struct {
-    BOOL mapped;
-    float bearing_deg;
-    INT center_error_px;
+typedef float float32_t;
+
+_Static_assert((sizeof(float32_t) == 4U) && (FLT_RADIX == 2) &&
+               (FLT_MANT_DIG == 24), "The startup map requires binary32 float.");
+
+typedef struct
+{
+    bool      b_is_mapped;
+    float32_t bearing_deg;
+    float32_t distance_mm;
+    int32_t   center_error_px;
 } direction_bearing_t;
 
 /* ---------- Shared state ---------- */
@@ -141,8 +154,12 @@ static marker_reading_t direction_map[DIRECTION_MARKER_COUNT];
 static BOOL direction_seen[DIRECTION_MARKER_COUNT];
 
 /* Mission-owned map. Index 0 stores ID 1, relative to the startup heading. */
-static direction_bearing_t startup_bearings[DIRECTION_MARKER_COUNT];
-static float startup_map_yaw_deg;
+static direction_bearing_t g_startup_bearings[DIRECTION_MARKER_COUNT] = {0};
+static float32_t g_startup_map_yaw_deg = 0.0f;
+
+static int32_t const g_full_turn_deg = 360;
+static int32_t const g_centidegrees_per_degree = 100;
+static float32_t const g_degrees_per_radian = 57.2957795f;
 
 /* ---------- Kernel objects ---------- */
 
@@ -1840,103 +1857,195 @@ static BOOL turn_to_scan_heading(float target_yaw, INT sweep_direction)
     return drive_turn_degrees_with_speed(degrees, TRUE);
 }
 
-/* GCC math built-ins avoid newlib's conflicting size_t declaration. */
-static float wrap_bearing_deg(float degrees)
+/** Wrap a bearing to one clockwise revolution. */
+static float32_t wrap_bearing_deg (float32_t degrees)
 {
-    float wrapped = __builtin_fmodf(degrees, 360.0f);
-    return wrapped < 0.0f ? wrapped + 360.0f : wrapped;
+    float32_t const full_turn_deg = (float32_t)g_full_turn_deg;
+    float32_t const wrapped = fmodf(degrees, full_turn_deg);
+
+    return (wrapped < 0.0f) ? (wrapped + full_turn_deg) : wrapped;
 }
 
-static BOOL read_direction_map_yaw(float *yaw_deg)
+/** Get a usable gyro heading before recording or using the startup map. */
+static bool read_direction_map_yaw (float32_t * p_yaw_deg)
 {
     imu_heading_reading_t reading = {0};
     imu_heading_read(&reading);
-    if (!mission_imu_healthy(&reading)) {
+
+    if ((!mission_imu_healthy(&reading)) || (!isfinite(reading.relative_deg)))
+    {
         mission_latch_stop("Gyro unavailable for direction bearings");
         mission_checkpoint();
-        return FALSE;
+        return false;
     }
 
-    *yaw_deg = reading.relative_deg;
-    return TRUE;
+    *p_yaw_deg = reading.relative_deg;
+    return true;
 }
 
-static BOOL map_direction_markers_at_startup(void)
+/** Keep the most centred observation and its distance for each marker. */
+static void update_startup_bearings (float32_t camera_bearing_deg)
+{
+    for (int32_t marker_id = 1; marker_id <= DIRECTION_MARKER_COUNT;
+         ++marker_id)
+    {
+        marker_reading_t marker = {0};
+
+        /* A displayed distance must fit the console's signed integer field. */
+        if ((!read_direction(marker_id, &marker)) ||
+            (!isfinite(marker.distance)) || (marker.distance <= 0.0f) ||
+            (marker.distance >= (float32_t)INT32_MAX) ||
+            (marker.x < 0) || (marker.x >= CAMERA_FRAME_WIDTH_PX))
+        {
+            continue;
+        }
+
+        int32_t const offset_px = marker.x - CAMERA_CENTER_X;
+        int32_t const center_error_px =
+            (offset_px < 0) ? -offset_px : offset_px;
+        direction_bearing_t * const p_entry =
+            &g_startup_bearings[marker_id - 1];
+
+        if (p_entry->b_is_mapped &&
+            (center_error_px >= p_entry->center_error_px))
+        {
+            continue;
+        }
+
+        /* Image offset is relative to the stopped camera heading. */
+        float32_t const image_angle_deg =
+            atanf((float32_t)offset_px / CAMERA_FOCAL_LENGTH_PX) *
+            g_degrees_per_radian;
+        float32_t const bearing_deg =
+            wrap_bearing_deg(camera_bearing_deg + image_angle_deg);
+
+        if (!isfinite(bearing_deg))
+        {
+            continue;
+        }
+
+        p_entry->bearing_deg      = bearing_deg;
+        p_entry->distance_mm      = marker.distance;
+        p_entry->center_error_px  = center_error_px;
+        p_entry->b_is_mapped      = true;
+    }
+}
+
+/** Report the accepted startup map once before the first pickup. */
+static void log_startup_direction_map (void)
+{
+    robot_logf((UB const *)"[map] bearings relative to startup; "
+                           "right positive\n");
+
+    for (int32_t marker_id = 1; marker_id <= DIRECTION_MARKER_COUNT;
+         ++marker_id)
+    {
+        direction_bearing_t const * const p_entry =
+            &g_startup_bearings[marker_id - 1];
+        char const * const p_name = direction_for_marker(marker_id);
+
+        if (!p_entry->b_is_mapped)
+        {
+            robot_logf((UB const *)"[map] ID:%d %s missing\n",
+                       (INT)marker_id, p_name);
+        }
+        else
+        {
+            int32_t const distance_mm = (int32_t)(p_entry->distance_mm + 0.5f);
+            int32_t const bearing_cd =
+                (int32_t)(p_entry->bearing_deg *
+                          (float32_t)g_centidegrees_per_degree);
+
+            robot_logf((UB const *)"[map] ID:%d %s distance=%d mm "
+                                   "bearing=%d.%02d deg\n",
+                       (INT)marker_id, p_name, (INT)distance_mm,
+                       (INT)(bearing_cd / g_centidegrees_per_degree),
+                       (INT)(bearing_cd % g_centidegrees_per_degree));
+        }
+    }
+}
+
+/** Sweep once and verify that the mission has enough direction markers. */
+static bool map_direction_markers_at_startup (void)
 {
     drive_stop();
-    if (!read_direction_map_yaw(&startup_map_yaw_deg))
-        return FALSE;
 
-    robot_logf((UB *)"[map] starting 360-degree direction sweep\n");
-    for (INT angle = 0; angle < 360; angle += DIRECTION_MAP_STEP_DEG) {
-        if (angle > 0 &&
-            !turn_to_scan_heading(
-                startup_map_yaw_deg + (float)angle * TURN_GYRO_RIGHT_SIGN, 1))
-            return FALSE;
-
-        robot_logf((UB *)"[map] scanning at %d degrees\n", angle);
-        if (!collect_marker_scan(FALSE, DIRECTION_SCAN_WINDOW_MS))
-            return FALSE;
-
-        float yaw_deg;
-        if (!read_direction_map_yaw(&yaw_deg))
-            return FALSE;
-        float camera_bearing_deg =
-            (yaw_deg - startup_map_yaw_deg) * TURN_GYRO_RIGHT_SIGN;
-
-        for (INT id = 1; id <= DIRECTION_MARKER_COUNT; ++id) {
-            marker_reading_t marker = {0};
-            if (!read_direction(id, &marker) || !(marker.distance > 0.0f) ||
-                marker.x < 0 || marker.x >= CAMERA_FRAME_WIDTH_PX)
-                continue;
-
-            INT offset_px = marker.x - CAMERA_CENTER_X;
-            INT center_error_px = offset_px < 0 ? -offset_px : offset_px;
-            direction_bearing_t *entry = &startup_bearings[id - 1];
-            if (entry->mapped && center_error_px >= entry->center_error_px)
-                continue;
-
-            /* Image offset is measured relative to the stopped camera heading. */
-            float image_angle_deg =
-                __builtin_atanf((float)offset_px / CAMERA_FOCAL_LENGTH_PX) *
-                57.2957795f;
-            entry->bearing_deg = wrap_bearing_deg(
-                camera_bearing_deg + image_angle_deg);
-            entry->center_error_px = center_error_px;
-            entry->mapped = TRUE;
-        }
+    if (!read_direction_map_yaw(&g_startup_map_yaw_deg))
+    {
+        return false;
     }
 
-    /* The last step completes the revolution without scanning the origin twice. */
-    if (!turn_to_scan_heading(
-            startup_map_yaw_deg + 360.0f * TURN_GYRO_RIGHT_SIGN, 1))
-        return FALSE;
+    robot_logf((UB const *)"[map] starting 360-degree direction sweep\n");
+
+    for (int32_t angle = 0; angle < g_full_turn_deg;
+         angle += DIRECTION_MAP_STEP_DEG)
+    {
+        float32_t const scan_yaw_deg =
+            g_startup_map_yaw_deg + ((float32_t)angle * TURN_GYRO_RIGHT_SIGN);
+
+        if ((angle > 0) && (FALSE == turn_to_scan_heading(scan_yaw_deg, 1)))
+        {
+            return false;
+        }
+
+        robot_logf((UB const *)"[map] scanning at %d degrees\n", (INT)angle);
+
+        if (FALSE == collect_marker_scan(FALSE, DIRECTION_SCAN_WINDOW_MS))
+        {
+            return false;
+        }
+
+        float32_t yaw_deg = 0.0f;
+
+        if (!read_direction_map_yaw(&yaw_deg))
+        {
+            return false;
+        }
+
+        float32_t const camera_bearing_deg =
+            (yaw_deg - g_startup_map_yaw_deg) * TURN_GYRO_RIGHT_SIGN;
+
+        update_startup_bearings(camera_bearing_deg);
+    }
+
+    /* Complete the revolution without scanning the origin twice. */
+    float32_t const end_yaw_deg = g_startup_map_yaw_deg +
+        ((float32_t)g_full_turn_deg * TURN_GYRO_RIGHT_SIGN);
+
+    if (FALSE == turn_to_scan_heading(end_yaw_deg, 1))
+    {
+        return false;
+    }
+
     drive_stop();
 
-    INT mapped_count = 0;
-    for (INT id = 1; id <= DIRECTION_MARKER_COUNT; ++id) {
-        const direction_bearing_t *entry = &startup_bearings[id - 1];
-        if (entry->mapped) {
+    int32_t mapped_count = 0;
+
+    for (int32_t idx = 0; idx < DIRECTION_MARKER_COUNT; ++idx)
+    {
+        if (g_startup_bearings[idx].b_is_mapped)
+        {
             ++mapped_count;
-            robot_logf((UB *)"[map] ID:%d %s bearing_cd=%d (right positive)\n",
-                       id, direction_for_marker(id),
-                       (INT)(entry->bearing_deg * 100.0f));
-        } else {
-            robot_logf((UB *)"[map] ID:%d %s missing\n",
-                       id, direction_for_marker(id));
         }
     }
 
-    INT required_count = DIRECTION_MAP_REQUIRE_ALL ? DIRECTION_MARKER_COUNT : 1;
-    robot_logf((UB *)"[map] sweep complete; mapped %d/%d; require %d\n",
-               mapped_count, DIRECTION_MARKER_COUNT, required_count);
-    if (mapped_count < required_count) {
+    int32_t const required_count =
+        (0 != DIRECTION_MAP_REQUIRE_ALL) ? DIRECTION_MARKER_COUNT : 1;
+
+    robot_logf((UB const *)"[map] sweep complete; mapped %d/%d; require %d\n",
+               (INT)mapped_count, (INT)DIRECTION_MARKER_COUNT,
+               (INT)required_count);
+
+    if (mapped_count < required_count)
+    {
         mission_latch_stop("Not enough direction markers mapped");
         mission_checkpoint();
-        return FALSE;
+        return false;
     }
 
-    return TRUE;
+    log_startup_direction_map();
+
+    return true;
 }
 
 static BOOL find_delivery_marker(marker_reading_t *target)
@@ -1945,22 +2054,24 @@ static BOOL find_delivery_marker(marker_reading_t *target)
 
     for (;;) {
         mission_checkpoint();
-        float yaw_deg;
+        float32_t yaw_deg = 0.0f;
         if (!read_direction_map_yaw(&yaw_deg))
             return FALSE;
 
-        float current_bearing_deg = wrap_bearing_deg(
-            (yaw_deg - startup_map_yaw_deg) * TURN_GYRO_RIGHT_SIGN);
+        float32_t const current_bearing_deg = wrap_bearing_deg(
+            (yaw_deg - g_startup_map_yaw_deg) * TURN_GYRO_RIGHT_SIGN);
         INT best_id = 0;
         float best_turn_deg = 0.0f;
         float smallest_turn_deg = 181.0f;
 
         for (INT i = 0; i < DIRECTION_MARKER_COUNT; ++i) {
-            if (!startup_bearings[i].mapped || tried[i])
+            if ((!g_startup_bearings[i].b_is_mapped) || tried[i])
+            {
                 continue;
+            }
 
             float turn_deg = wrap_bearing_deg(
-                startup_bearings[i].bearing_deg - current_bearing_deg);
+                g_startup_bearings[i].bearing_deg - current_bearing_deg);
             if (turn_deg > 180.0f)
                 turn_deg -= 360.0f;
             float turn_size_deg = __builtin_fabsf(turn_deg);
@@ -1974,9 +2085,14 @@ static BOOL find_delivery_marker(marker_reading_t *target)
             break;
 
         tried[best_id - 1] = TRUE;
-        robot_logf((UB *)"[map aim] ID:%d bearing_cd=%d turn_cd=%d\n",
-                   best_id, (INT)(startup_bearings[best_id - 1].bearing_deg * 100.0f),
-                   (INT)(best_turn_deg * 100.0f));
+        float32_t const centidegrees_per_degree =
+            (float32_t)g_centidegrees_per_degree;
+        float32_t const best_bearing_deg =
+            g_startup_bearings[best_id - 1].bearing_deg;
+
+        robot_logf((UB const *)"[map aim] ID:%d bearing_cd=%d turn_cd=%d\n",
+                   best_id, (INT)(best_bearing_deg * centidegrees_per_degree),
+                   (INT)(best_turn_deg * centidegrees_per_degree));
         if (!drive_turn_degrees(best_turn_deg))
             return FALSE;
 
