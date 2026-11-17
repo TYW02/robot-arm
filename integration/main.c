@@ -8,6 +8,8 @@
 #include "../components/drive/drive_turn.h"
 
 #include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 /* ---------- Configuration ---------- */
 
@@ -80,6 +82,16 @@ typedef struct {
     UB bytes[4];
 } ModeCommand;
 
+/* Bytes and diagnostics kept between camera UART reads. */
+typedef struct
+{
+    char     frame[RX_LINE_SIZE];
+    char     noise[16];
+    uint32_t length;
+    uint32_t noise_length;
+    UW       discarded_bytes;
+} camera_rx_state_t;
+
 typedef struct {
     INT left;
     INT right;
@@ -127,7 +139,6 @@ static BOOL released_object_ids[MAX_ARUCO_IDS];
 
 static marker_reading_t direction_map[DIRECTION_MARKER_COUNT];
 static BOOL direction_seen[DIRECTION_MARKER_COUNT];
-static int direction_count;
 
 /* Mission-owned map. Index 0 stores ID 1, relative to the startup heading. */
 static direction_bearing_t startup_bearings[DIRECTION_MARKER_COUNT];
@@ -155,8 +166,8 @@ LOCAL UW drive_mbf_buffer[
     (4 * (sizeof(DriveCommand) + 4)) / sizeof(UW) + 8
 ];
 
-LOCAL void task_uart_rx(INT stacd, void *exinf);
-LOCAL void task_uart_tx(INT stacd, void *exinf);
+static void camera_rx_task (INT start_code, void * p_extension);
+static void camera_tx_task (INT start_code, void * p_extension);
 LOCAL void task_state_machine(INT stacd, void *exinf);
 LOCAL void task_drive(INT stacd, void *exinf);
 LOCAL void task_imu_monitor(INT stacd, void *exinf);
@@ -164,7 +175,7 @@ LOCAL void task_imu_monitor(INT stacd, void *exinf);
 LOCAL T_CTSK ctsk_uart_rx = {
     .itskpri = 5,
     .stksz = 4096,
-    .task = task_uart_rx,
+    .task = camera_rx_task,
 #if TK_SUPPORT_SMP
     .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC,
     .assprc = TP_PRC1,
@@ -176,7 +187,7 @@ LOCAL T_CTSK ctsk_uart_rx = {
 LOCAL T_CTSK ctsk_uart_tx = {
     .itskpri = 6,
     .stksz = 4096,
-    .task = task_uart_tx,
+    .task = camera_tx_task,
 #if TK_SUPPORT_SMP
     .tskatr = TA_HLNG | TA_RNG3 | TA_ASSPRC,
     .assprc = TP_PRC1,
@@ -760,494 +771,478 @@ LOCAL void task_imu_monitor(INT stacd, void *exinf)
     }
 }
 
-/* ---------- Camera data helpers ---------- */
+/* ---------- Camera UART framing and detections ---------- */
 
-static const char *direction_for_marker(int id)
+/** Translate a direction marker ID into the name used by mission logs. */
+static char const * direction_for_marker (int id)
 {
-    switch (id) {
-    case 1: return "North";
-    case 2: return "West";
-    case 3: return "East";
-    default: return NULL;
+    switch (id)
+    {
+        case 1: return "North";
+        case 2: return "West";
+        case 3: return "East";
+        default: return NULL;
     }
 }
 
-int my_strlen(const char *s)
+/** Find the first checksum separator in a null-terminated frame. */
+static char * camera_checksum_start (char * p_frame)
 {
-    int len = 0;
-    while (*s++)
-        len++;
-    return len;
-}
-
-char *my_strchr(const char *s, int c)
-{
-    while (*s != (char)c) {
-        if (!*s++)
-            return 0;
-    }
-    return (char *)s;
-}
-
-char *my_strstr(const char *haystack, const char *needle)
-{
-    if (!*needle)
-        return (char *)haystack;
-
-    char *p1 = (char *)haystack;
-
-    while (*p1) {
-        char *p1_begin = p1;
-        char *p2 = (char *)needle;
-
-        while (*p1 && *p2 && *p1 == *p2) {
-            p1++;
-            p2++;
-        }
-
-        if (!*p2)
-            return p1_begin;
-
-        p1 = p1_begin + 1;
+    while ((*p_frame != '\0') && (*p_frame != '*'))
+    {
+        ++p_frame;
     }
 
-    return 0;
+    return ((*p_frame == '*') ? p_frame : NULL);
 }
 
-int parse_int(char **str)
+/** Consume one unsigned decimal field, including its comma if present. */
+static int camera_parse_integer (char ** pp_field)
 {
-    int res = 0;
+    int value = 0;
+    char * p_cursor = *pp_field;
 
-    while (**str >= '0' && **str <= '9') {
-        res = res * 10 + (**str - '0');
-        (*str)++;
+    while ((*p_cursor >= '0') && (*p_cursor <= '9'))
+    {
+        value = (value * 10) + (*p_cursor - '0');
+        ++p_cursor;
     }
 
-    if (**str == ',')
-        (*str)++;
+    if (*p_cursor == ',')
+    {
+        ++p_cursor;
+    }
 
-    return res;
+    *pp_field = p_cursor;
+    return value;
 }
 
-float parse_float(char **str)
+/** Consume one signed decimal field using the camera's fixed-point text. */
+static float camera_parse_decimal (char ** pp_field)
 {
-    float res = 0.0f;
+    float value = 0.0f;
     int sign = 1;
+    char * p_cursor = *pp_field;
 
-    if (**str == '-') {
+    if (*p_cursor == '-')
+    {
         sign = -1;
-        (*str)++;
+        ++p_cursor;
     }
 
-    while (**str >= '0' && **str <= '9') {
-        res = res * 10.0f + (**str - '0');
-        (*str)++;
+    while ((*p_cursor >= '0') && (*p_cursor <= '9'))
+    {
+        value = (value * 10.0f) + (*p_cursor - '0');
+        ++p_cursor;
     }
 
-    if (**str == '.') {
-        float frac = 0.1f;
-        (*str)++;
+    if (*p_cursor == '.')
+    {
+        float fraction = 0.1f;
+        ++p_cursor;
 
-        while (**str >= '0' && **str <= '9') {
-            res += (**str - '0') * frac;
-            frac *= 0.1f;
-            (*str)++;
+        while ((*p_cursor >= '0') && (*p_cursor <= '9'))
+        {
+            value += (*p_cursor - '0') * fraction;
+            fraction *= 0.1f;
+            ++p_cursor;
         }
     }
 
-    if (**str == ',')
-        (*str)++;
-
-    return res * sign;
-}
-
-static int uart_hex_value(char ch)
-{
-    if (ch >= '0' && ch <= '9')
-        return ch - '0';
-
-    if (ch >= 'A' && ch <= 'F')
-        return ch - 'A' + 10;
-
-    if (ch >= 'a' && ch <= 'f')
-        return ch - 'a' + 10;
-
-    return -1;
-}
-
-void send_mode_command(const char *mode)
-{
-    ModeCommand command = {{0, 0, 0, 0}};
-    UW len = 0;
-
-    while (len < sizeof(command.bytes) &&
-           mode[len] != '\0') {
-        command.bytes[len] = (UB)mode[len];
-        ++len;
+    if (*p_cursor == ',')
+    {
+        ++p_cursor;
     }
 
-    if (len == 0 ||
-        tk_snd_mbf(
-            command_mbf_id,
-            &command,
-            sizeof(command),
-            TMO_FEVR
-        ) < E_OK) {
+    *pp_field = p_cursor;
+    return value * sign;
+}
 
-        robot_logf(
-            (UB *)"[UART] failed to queue mode command\n"
-        );
+/** Decode a hexadecimal checksum digit. */
+static int camera_hex_value (char digit)
+{
+    if ((digit >= '0') && (digit <= '9'))
+    {
+        return digit - '0';
+    }
+    else if ((digit >= 'A') && (digit <= 'F'))
+    {
+        return (digit - 'A') + 10;
+    }
+    else if ((digit >= 'a') && (digit <= 'f'))
+    {
+        return (digit - 'a') + 10;
+    }
+    else
+    {
+        return -1;
     }
 }
 
-static void process_uart_line(char *buffer)
+/** Check the XOR and remove the checksum before parsing the payload. */
+static bool camera_validate_frame (char * p_frame)
 {
-    int idx = my_strlen(buffer);
+    char * p_checksum = camera_checksum_start(p_frame);
 
-    while (idx > 0 &&
-           (buffer[idx - 1] == '\r' ||
-            buffer[idx - 1] == '\n')) {
-        buffer[--idx] = '\0';
+    if ((p_checksum == NULL) || (p_checksum[1] == '\0') ||
+        (p_checksum[2] == '\0') || (p_checksum[3] != '\0'))
+    {
+        return false;
     }
 
-    if (idx == 0)
+    int high = camera_hex_value(p_checksum[1]);
+    int low  = camera_hex_value(p_checksum[2]);
+
+    if ((high < 0) || (low < 0))
+    {
+        return false;
+    }
+
+    uint8_t expected = 0U;
+
+    for (char * p_byte = p_frame; p_byte < p_checksum; ++p_byte)
+    {
+        /* Convert the UART character back to its unsigned byte value. */
+        expected ^= (uint8_t)*p_byte;
+    }
+
+    if (expected != ((high << 4) | low))
+    {
+        return false;
+    }
+
+    *p_checksum = '\0';
+    return true;
+}
+
+/** Update an object observation while the detection table is locked. */
+static void camera_store_object (marker_reading_t const * p_marker)
+{
+    int id = p_marker->id;
+
+    if ((id <= DIRECTION_MARKER_COUNT) || (id >= MAX_ARUCO_IDS) ||
+        released_object_ids[id])
+    {
         return;
+    }
 
-    char *star = my_strchr(buffer, '*');
-
-    /* Reject bad checksums without logging every dropped frame. */
-    if (star == NULL || my_strlen(star + 1) != 2)
-        return;
-
-    int hi = uart_hex_value(star[1]);
-    int lo = uart_hex_value(star[2]);
-
-    if (hi < 0 || lo < 0)
-        return;
-
-    UB expected = 0;
-
-    for (char *p = buffer; p < star; ++p)
-        expected ^= (UB)*p;
-
-    if (expected != (UB)((hi << 4) | lo))
-        return;
-
-    *star = '\0';
-
-    char *start;
-
-    if ((start = my_strstr(buffer, "A,")) != NULL) {
-        start += 2;
-
-        int id = parse_int(&start);
-        int x = parse_int(&start);
-        int y = parse_int(&start);
-
-        (void)parse_float(&start);
-        float dist = parse_float(&start);
-
-        const char *direction = direction_for_marker(id);
-
-        if (tk_loc_mtx(mtx_id, TMO_FEVR) < E_OK)
+    for (int slot = 0; slot < object_count; ++slot)
+    {
+        if (object_map[slot].id == id)
+        {
+            object_map[slot] = *p_marker;
             return;
-
-        if (direction != NULL) {
-            int slot = id - 1;
-
-            if (!direction_seen[slot]) {
-                direction_seen[slot] = TRUE;
-                direction_count++;
-            }
-
-            direction_map[slot].id = id;
-            direction_map[slot].x = x;
-            direction_map[slot].y = y;
-            direction_map[slot].distance = dist;
-
-        } else if (id >= 4 &&
-                   id < MAX_ARUCO_IDS &&
-                   !released_object_ids[id]) {
-
-            int slot = -1;
-
-            for (int i = 0; i < object_count; ++i) {
-                if (object_map[i].id == id) {
-                    slot = i;
-                    break;
-                }
-            }
-
-            if (slot < 0 && object_count < MAX_OBJECTS) {
-                slot = object_count++;
-                object_map[slot].id = id;
-            }
-
-            if (slot >= 0) {
-                object_map[slot].x = x;
-                object_map[slot].y = y;
-                object_map[slot].distance = dist;
-            }
         }
-
-        (void)tk_unl_mtx(mtx_id);
-        return;
     }
 
-    if ((start = my_strstr(buffer, "C,")) != NULL) {
-        start += 2;
-        char color = *start;
-
-        if (color == 'N') {
-            robot_logf(
-                (UB *)"  -> No recognized payload color\n"
-            );
-        } else if (start[1] == ',') {
-            start += 2;
-
-            int x = parse_int(&start);
-            int y = parse_int(&start);
-
-            robot_logf(
-                (UB *)"  -> Payload found: COLOR %c "
-                       "at X:%d Y:%d\n",
-                color, x, y
-            );
-        } else {
-            robot_logf(
-                (UB *)"[UART RX] malformed color frame\n"
-            );
-        }
-
-        return;
-    }
-
-    robot_logf(
-        (UB *)"[UART RX] valid checksum, unknown frame type\n"
-    );
-}
-
-/* ---------- Camera UART tasks ---------- */
-
-LOCAL void task_uart_tx(INT stacd, void *exinf)
-{
-    ModeCommand command;
-
-    (void)stacd;
-    (void)exinf;
-
-    for (;;) {
-        if (tk_rcv_mbf(
-                command_mbf_id,
-                &command,
-                TMO_FEVR
-            ) == (INT)sizeof(command)) {
-
-            SZ written;
-
-            ER err = tk_swri_dev(
-                uart_device_id,
-                0,
-                command.bytes,
-                sizeof(command.bytes),
-                &written
-            );
-
-            if (err < E_OK) {
-                robot_logf(
-                    (UB *)"[UART] write error %d\n",
-                    err
-                );
-            }
-        }
+    if (object_count < MAX_OBJECTS)
+    {
+        object_map[object_count] = *p_marker;
+        ++object_count;
     }
 }
 
-LOCAL void task_uart_rx(INT stacd, void *exinf)
+/** Parse an ArUco report and publish it to the active scan. */
+static void camera_receive_marker (char * p_field)
 {
-    char buffer[RX_LINE_SIZE];
+    marker_reading_t marker = {0};
+
+    marker.id = camera_parse_integer(&p_field);
+    marker.x  = camera_parse_integer(&p_field);
+    marker.y  = camera_parse_integer(&p_field);
+
+    /* Skip the reported width. Steering uses the following distance. */
+    (void)camera_parse_decimal(&p_field);
+    marker.distance = camera_parse_decimal(&p_field);
+
+    if (tk_loc_mtx(mtx_id, TMO_FEVR) < E_OK)
+    {
+        return;
+    }
+
+    if ((marker.id >= 1) && (marker.id <= DIRECTION_MARKER_COUNT))
+    {
+        int slot = marker.id - 1;
+
+        direction_map[slot]  = marker;
+        direction_seen[slot] = TRUE;
+    }
+    else
+    {
+        camera_store_object(&marker);
+    }
+
+    (void)tk_unl_mtx(mtx_id);
+}
+
+/** Log a color observation from the XIAO. */
+static void camera_receive_color (char * p_field)
+{
+    char color = *p_field;
+
+    if (color == 'N')
+    {
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)"  -> No recognized payload color\n");
+    }
+    else if ((color != '\0') && (p_field[1] == ','))
+    {
+        p_field += 2;
+
+        int position_x = camera_parse_integer(&p_field);
+        int position_y = camera_parse_integer(&p_field);
+
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)"  -> Payload found: COLOR %c at X:%d Y:%d\n",
+                   color, position_x, position_y);
+    }
+    else
+    {
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)"[UART RX] malformed color frame\n");
+    }
+}
+
+/** Dispatch a complete, checksum-verified UART frame. */
+static void camera_receive_frame (char * p_frame)
+{
+    /* Ignore corrupted UART frames without flooding the mission log. */
+    if (!camera_validate_frame(p_frame))
+    {
+        return;
+    }
+
+    if ((p_frame[0] == 'A') && (p_frame[1] == ','))
+    {
+        camera_receive_marker(p_frame + 2);
+    }
+    else if ((p_frame[0] == 'C') && (p_frame[1] == ','))
+    {
+        camera_receive_color(p_frame + 2);
+    }
+    else
+    {
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)
+                   "[UART RX] valid checksum, unknown frame type\n");
+    }
+}
+
+/** Queue the camera's four-byte mode command for the transmit task. */
+static void send_mode_command (char const * p_mode)
+{
+    ModeCommand command = {{0}};
+    UW length = 0U;
+
+    while ((length < sizeof(command.bytes)) && (p_mode[length] != '\0'))
+    {
+        /* The mode command is ASCII and the UART API uses unsigned bytes. */
+        command.bytes[length] = (UB)p_mode[length];
+        ++length;
+    }
+
+    if ((length == 0U) ||
+        (tk_snd_mbf(command_mbf_id, &command, sizeof(command), TMO_FEVR)
+         < E_OK))
+    {
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)"[UART] failed to queue mode command\n");
+    }
+}
+
+/** Own UART writes so mission tasks only enqueue camera commands. */
+static void camera_tx_task (INT start_code, void * p_extension)
+{
+    (void)start_code;
+    (void)p_extension;
+
+    for (;;)
+    {
+        ModeCommand command = {{0}};
+
+        /* The four-byte message fits in the kernel's signed result type. */
+        if (tk_rcv_mbf(command_mbf_id, &command, TMO_FEVR)
+            == (INT)sizeof(command))
+        {
+            SZ written = 0;
+            ER error = tk_swri_dev(uart_device_id, 0, command.bytes,
+                                   sizeof(command.bytes), &written);
+
+            if (error < E_OK)
+            {
+                /* The monitor logger uses kernel byte format strings. */
+                robot_logf((UB const *)"[UART] write error %d\n", error);
+            }
+        }
+    }
+}
+
+/** Print a bounded sample of discarded UART data in hexadecimal. */
+static void camera_log_bytes (char const * p_bytes, uint32_t length)
+{
+    static char const hex[] = "0123456789ABCDEF";
+
+    for (uint32_t index = 0U; index < length; ++index)
+    {
+        /* The unsigned byte is split into two indices from 0 through 15. */
+        uint8_t value = (uint8_t)p_bytes[index];
+
+        /* The monitor logger takes a format string in kernel byte types. */
+        robot_logf((UB const *)" %c%c", hex[value >> 4U], hex[value & 0x0FU]);
+    }
+
+    /* End the byte sample in the monitor. */
+    robot_logf((UB const *)"\n");
+}
+
+/** Keep only the first bytes of a run of UART noise for diagnostics. */
+static void camera_record_noise (camera_rx_state_t * p_state, char byte)
+{
+    if (p_state->noise_length < sizeof(p_state->noise))
+    {
+        p_state->noise[p_state->noise_length] = byte;
+        ++p_state->noise_length;
+    }
+}
+
+/** Append a byte, or drop and report a frame exceeding the receive buffer. */
+static void camera_append_byte (camera_rx_state_t * p_state, char byte)
+{
+    if (p_state->length >= (sizeof(p_state->frame) - 1U))
+    {
+        uint32_t sample_length = sizeof(p_state->noise);
+
+        /* The buffer sample is 16 bytes, which fits the %d argument. */
+        robot_logf((UB const *)"[UART RX] oversized frame; first %d bytes:",
+                   (INT)sample_length);
+        camera_log_bytes(p_state->frame, sample_length);
+        p_state->length = 0U;
+        return;
+    }
+
+    p_state->frame[p_state->length] = byte;
+    ++p_state->length;
+    p_state->frame[p_state->length] = '\0';
+
+    char const * p_checksum = camera_checksum_start(p_state->frame);
+
+    /* Dispatch after two checksum digits even if the newline was lost. */
+    if ((p_checksum != NULL) &&
+        ((p_state->frame + p_state->length) - (p_checksum + 1) == 2))
+    {
+        camera_receive_frame(p_state->frame);
+        p_state->length = 0U;
+    }
+}
+
+/** Assemble ArUco and color frames and recover after a lost separator. */
+static void camera_receive_byte (camera_rx_state_t * p_state, char byte)
+{
+    bool b_is_prefix = (byte == 'A') || (byte == 'C');
+
+    if ((byte == '\r') || (byte == '\n'))
+    {
+        if (p_state->length > 2U)
+        {
+            camera_receive_frame(p_state->frame);
+        }
+
+        p_state->length = 0U;
+        return;
+    }
+
+    if (p_state->length == 0U)
+    {
+        if (b_is_prefix)
+        {
+            p_state->noise_length = 0U;
+            camera_append_byte(p_state, byte);
+        }
+        else
+        {
+            camera_record_noise(p_state, byte);
+            ++p_state->discarded_bytes;
+
+            if ((p_state->discarded_bytes & 127U) == 0U)
+            {
+                /* The monitor uses UW for its unsigned diagnostic counter. */
+                robot_logf((UB const *)
+                           "[UART RX] discarded %u "
+                           "bytes without a frame prefix; sample:",
+                           p_state->discarded_bytes);
+                camera_log_bytes(p_state->noise, p_state->noise_length);
+                p_state->noise_length = 0U;
+            }
+        }
+
+        return;
+    }
+
+    if (p_state->length == 1U)
+    {
+        if (byte == ',')
+        {
+            camera_append_byte(p_state, byte);
+        }
+        else if (b_is_prefix)
+        {
+            p_state->frame[0] = byte;
+        }
+        else
+        {
+            camera_record_noise(p_state, p_state->frame[0]);
+            camera_record_noise(p_state, byte);
+            p_state->length = 0U;
+            ++p_state->discarded_bytes;
+        }
+
+        return;
+    }
+
+    /* A or C inside the payload signals a new frame after a truncated one. */
+    if (b_is_prefix && (camera_checksum_start(p_state->frame) == NULL))
+    {
+        p_state->length = 0U;
+    }
+
+    camera_append_byte(p_state, byte);
+}
+
+/** Poll the kernel UART and feed complete read batches to the frame parser. */
+static void camera_rx_task (INT start_code, void * p_extension)
+{
+    (void)start_code;
+    (void)p_extension;
+
+    camera_rx_state_t state = {0};
     char pending[32];
 
-    SZ pending_size = 0;
-    SZ pending_index = 0;
+    for (;;)
+    {
+        SZ available = 0;
+        ER error = tk_srea_dev(uart_device_id, 0, NULL, 0, &available);
 
-    int index = 0;
-    UW discarded_bytes = 0;
-
-    UB noise_sample[16];
-    INT noise_sample_size = 0;
-
-    (void)stacd;
-    (void)exinf;
-
-    for (;;) {
-        if (pending_index >= pending_size) {
-            SZ available = 0;
-
-            ER err = tk_srea_dev(
-                uart_device_id,
-                0,
-                NULL,
-                0,
-                &available
-            );
-
-            if (err < E_OK || available <= 0) {
-                (void)tk_dly_tsk(1);
-                continue;
-            }
-
-            pending_size =
-                available < (SZ)sizeof(pending)
-                    ? available
-                    : (SZ)sizeof(pending);
-
-            pending_index = 0;
-
-            err = tk_srea_dev(
-                uart_device_id,
-                0,
-                pending,
-                pending_size,
-                &pending_size
-            );
-
-            if (err < E_OK || pending_size <= 0) {
-                pending_size = 0;
-                pending_index = 0;
-                (void)tk_dly_tsk(1);
-                continue;
-            }
+        if ((error < E_OK) || (available <= 0))
+        {
+            (void)tk_dly_tsk(1);
+            continue;
         }
 
-        while (pending_index < pending_size) {
-            char ch = pending[pending_index++];
+        /* The local buffer is 32 bytes, well within the kernel size type. */
+        SZ capacity = (SZ)sizeof(pending);
+        SZ requested = (available < capacity) ? available : capacity;
+        SZ received = 0;
+        error = tk_srea_dev(uart_device_id, 0, pending, requested, &received);
 
-            if (ch == '\r' || ch == '\n') {
-                if (index > 2) {
-                    buffer[index] = '\0';
-                    process_uart_line(buffer);
-                }
+        if ((error < E_OK) || (received <= 0))
+        {
+            (void)tk_dly_tsk(1);
+            continue;
+        }
 
-                index = 0;
-                continue;
-            }
-
-            if (index == 0) {
-                if (ch == 'A' || ch == 'C') {
-                    noise_sample_size = 0;
-                    buffer[index++] = ch;
-                    buffer[index] = '\0';
-                } else {
-                    if (noise_sample_size <
-                        (INT)sizeof(noise_sample)) {
-                        noise_sample[noise_sample_size++] =
-                            (UB)ch;
-                    }
-
-                    discarded_bytes++;
-
-                    if ((discarded_bytes & 127U) == 0U) {
-                        static const char hex[] =
-                            "0123456789ABCDEF";
-
-                        robot_logf(
-                            (UB *)"[UART RX] discarded %u "
-                                   "bytes without a frame prefix; "
-                                   "sample:",
-                            discarded_bytes
-                        );
-
-                        for (INT i = 0;
-                             i < noise_sample_size;
-                             ++i) {
-                            robot_logf(
-                                (UB *)" %c%c",
-                                hex[noise_sample[i] >> 4],
-                                hex[noise_sample[i] & 0x0F]
-                            );
-                        }
-
-                        robot_logf((UB *)"\n");
-                        noise_sample_size = 0;
-                    }
-                }
-
-                continue;
-            }
-
-            if (index == 1) {
-                if (ch == ',') {
-                    buffer[index++] = ch;
-                    buffer[index] = '\0';
-                } else if (ch == 'A' || ch == 'C') {
-                    buffer[0] = ch;
-                } else {
-                    if (noise_sample_size <
-                        (INT)sizeof(noise_sample)) {
-                        noise_sample[noise_sample_size++] =
-                            (UB)buffer[0];
-
-                        if (noise_sample_size <
-                            (INT)sizeof(noise_sample)) {
-                            noise_sample[noise_sample_size++] =
-                                (UB)ch;
-                        }
-                    }
-
-                    index = 0;
-                    discarded_bytes++;
-                }
-
-                continue;
-            }
-
-            if (my_strchr(buffer, '*') == NULL &&
-                (ch == 'A' || ch == 'C')) {
-
-                buffer[0] = ch;
-                buffer[1] = '\0';
-                index = 1;
-                continue;
-            }
-
-            if (index < RX_LINE_SIZE - 1) {
-                buffer[index++] = ch;
-                buffer[index] = '\0';
-
-                char *star = my_strchr(buffer, '*');
-
-                if (star != NULL &&
-                    (SZ)(buffer + index - (star + 1)) == 2) {
-
-                    process_uart_line(buffer);
-                    index = 0;
-                }
-            } else {
-                static const char hex[] =
-                    "0123456789ABCDEF";
-
-                int sample = index < 16 ? index : 16;
-
-                robot_logf(
-                    (UB *)"[UART RX] oversized frame; "
-                           "first %d bytes:",
-                    sample
-                );
-
-                for (int i = 0; i < sample; ++i) {
-                    UB value = (UB)buffer[i];
-
-                    robot_logf(
-                        (UB *)" %c%c",
-                        hex[value >> 4],
-                        hex[value & 0x0F]
-                    );
-                }
-
-                robot_logf((UB *)"\n");
-                index = 0;
-            }
+        for (SZ index = 0; index < received; ++index)
+        {
+            camera_receive_byte(&state, pending[index]);
         }
     }
 }
@@ -1604,7 +1599,6 @@ static void clear_scan_results(void)
         return;
 
     object_count = 0;
-    direction_count = 0;
 
     for (int i = 0; i < DIRECTION_MARKER_COUNT; ++i)
         direction_seen[i] = FALSE;
