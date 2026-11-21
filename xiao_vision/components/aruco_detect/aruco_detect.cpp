@@ -10,7 +10,6 @@
 #define ARUCO_DB ARUCO_DB_4X4_1000
 #include "ArucoLite.h"
 
-#define REAL_MARKER_SIZE_MM 80.0f
 #define FOCAL_LENGTH_PX     277.0f
 
 typedef ArucoLite<320, 240, 16, false> MyAruco_t;
@@ -29,22 +28,26 @@ static void rgb565_to_gray(camera_fb_t *fb, uint8_t *gray_buf) {
     }
 }
 
-aruco_result_t aruco_detect_frame(camera_fb_t *fb) {
-    // 2. FIX INITIALIZER: Use {} instead of {0} for C++ structs
-    aruco_result_t result = {};
+int aruco_detect_frame(camera_fb_t *fb, float marker_size_mm,
+                       aruco_result_t *results, int result_capacity) {
+    if (fb == nullptr || results == nullptr || result_capacity <= 0 ||
+        fb->width != 320 || fb->height != 240 || marker_size_mm <= 0.0f) {
+        return 0;
+    }
 
     // 3. FIX POINTER: Cast the 2D array to a 1D pointer
     rgb565_to_gray(fb, (uint8_t*)aruco_frame.data);
 
     aruco.process(aruco_frame);
 
-    if (aruco.arucos_found > 0) {
-        // 4. FIX TYPE: Use auto to safely reference the template type
-        auto &marker = aruco.result[0]; 
-        
+    int count = aruco.arucos_found;
+    if (count > result_capacity) count = result_capacity;
+    for (int i = 0; i < count; ++i) {
+        const auto &marker = aruco.result[i];
+        aruco_result_t &result = results[i];
+        result = {};
         result.detected = true;
-        result.marker_id = marker.aruco_idx;
-
+        result.marker_id = (int)marker.aruco_idx;
         float sx = 0, sy = 0;
         for (int p = 0; p < 4; p++) {
             sx += marker.pt[p].x;
@@ -58,9 +61,9 @@ aruco_result_t aruco_detect_frame(camera_fb_t *fb) {
         result.width_px = (top_w + bot_w) / 2.0;
 
         if (result.width_px > 0) {
-            result.distance_mm = (REAL_MARKER_SIZE_MM * FOCAL_LENGTH_PX) / result.width_px;
+            result.distance_mm = (marker_size_mm * FOCAL_LENGTH_PX) / result.width_px;
         }
     }
 
-    return result;
+    return count;
 }

@@ -1,35 +1,26 @@
-#include "freertos/FreeRTOS.h"
-#include "aruco_detect.h"
-#include "freertos/task.h"
-#include "driver/uart.h"
-#include "esp_log.h"
-#include "esp_camera.h"
-#include <string.h>
-#include <stdio.h>
-#include <stdarg.h>
+/** @file main.c
+ *  @brief Capture XIAO camera frames and report detections to the Pico.
+ */
 
-// ======================================================
-// UART (to Pico W)
-// ======================================================
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "aruco_detect.h"
+#include "driver/uart.h"
+#include "esp_camera.h"
+#include "esp_log.h"
+
+#include <stdbool.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 #define VISION_UART_NUM      UART_NUM_0
 #define VISION_UART_TX_PIN   43   // D6 on XIAO ESP32-S3
 #define VISION_UART_RX_PIN   44   // D7 on XIAO ESP32-S3
 #define VISION_UART_BAUD     115200
 #define BUF_SIZE             256
 
-// ======================================================
-// Phase/Mode Management
-// ======================================================
-typedef enum { MODE_IDLE, MODE_SCAN, MODE_COLOR } vision_mode_t;
-
-// Start in COLOR mode by default
-static volatile vision_mode_t g_mode = MODE_SCAN; 
-
-static const char *TAG = "VISION";
-
-// ======================================================
-// Camera pins — XIAO ESP32-S3 Sense
-// ======================================================
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM     10
@@ -48,125 +39,121 @@ static const char *TAG = "VISION";
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
-// ======================================================
-// Color detection
-// ======================================================
-typedef enum { COLOR_NONE = 0, COLOR_RED, COLOR_GREEN, COLOR_BLUE } color_t;
+#define STRIDE                 4
+#define MIN_COLOR_PERCENT      2
+#define HISTORY_LEN            5
+#define COLOR_CONSENSUS_VOTES  3
+#define ARUCO_RESULT_CAPACITY  16
+#define UART_FRAME_CAPACITY    64
+#define CAMERA_LOOP_MS         50U
+#define UART_READ_TIMEOUT_MS   100U
+#define REPORT_INTERVAL_MS     1000U
+#define COLOR_MOVE_PIXELS      10
 
-#define STRIDE 4   
-
-static void rgb_to_hsv(uint8_t r, uint8_t g, uint8_t b,
-                       uint8_t *h, uint8_t *s, uint8_t *v)
+typedef enum
 {
-    uint8_t max = r > g ? (r > b ? r : b) : (g > b ? g : b);
-    uint8_t min = r < g ? (r < b ? r : b) : (g < b ? g : b);
-    uint8_t delta = max - min;
+    MODE_IDLE,
+    MODE_SCAN,
+    MODE_COLOR
+} vision_mode_t;
 
-    *v = max;
-    if (max == 0) { *s = 0; *h = 0; return; }
-    *s = (uint8_t)(((uint32_t)delta * 255) / max);
-    if (delta == 0) { *h = 0; return; }
+typedef enum
+{
+    COMMAND_WAIT_PREFIX,
+    COMMAND_WAIT_COMMA,
+    COMMAND_WAIT_MODE,
+    COMMAND_WAIT_NEWLINE
+} command_state_t;
 
-    int32_t hue;   // use int32_t to avoid any promotion surprises
-    if (max == r) {
-        hue = 43 * ((int32_t)g - (int32_t)b) / (int32_t)delta;
-    } else if (max == g) {
-        hue = 85 + 43 * ((int32_t)b - (int32_t)r) / (int32_t)delta;
-    } else {
-        hue = 171 + 43 * ((int32_t)r - (int32_t)g) / (int32_t)delta;
+typedef enum
+{
+    COLOR_NONE = 0,
+    COLOR_RED,
+    COLOR_GREEN,
+    COLOR_BLUE,
+    COLOR_COUNT
+} color_t;
+
+typedef struct
+{
+    color_t color;
+    int16_t x;     /**< Centroid column in the original frame. */
+    int16_t y;     /**< Centroid row in the original frame. */
+} color_detection_t;
+
+typedef struct
+{
+    color_detection_t detection;
+    uint32_t          time_ms;
+} color_report_t;
+
+static char const * const gp_tag = "VISION";
+/* The command task writes the selected mode and physical marker size. */
+static vision_mode_t volatile g_mode = MODE_SCAN;
+static int volatile g_marker_size_mm = 80;
+static color_detection_t g_color_history[HISTORY_LEN];
+static uint32_t g_history_index = 0U;
+
+static void initialise_uart (void);
+static esp_err_t initialise_camera (void);
+static void camera_uart_rx_task (void * p_argument);
+static void report_markers (camera_fb_t * p_frame, uint32_t * p_last_status_ms);
+static void report_color (camera_fb_t const * p_frame,
+                          color_report_t * p_previous);
+
+void app_main (void)
+{
+    ESP_LOGI(gp_tag, "Starting color detection...");
+    initialise_uart();
+
+    xTaskCreate(camera_uart_rx_task, "uart_rx", 8192, NULL, 5, NULL);
+
+    if (initialise_camera() != ESP_OK)
+    {
+        ESP_LOGE(gp_tag, "Camera failed, halting");
+        return;
     }
-    if (hue < 0) hue += 255;
-    if (hue > 255) hue = 255;
-    *h = (uint8_t)hue;
-}
 
-static color_t classify_hsv(uint8_t h, uint8_t s, uint8_t v)
-{
-    if (v < 30 || s < 60) return COLOR_NONE;
+    ESP_LOGI(gp_tag, "Camera ready.");
 
-    if ((h <= 15 || h >= 240) && s > 70) return COLOR_RED;
-    if (h >= 60 && h <= 90 && s > 120)   return COLOR_GREEN;
-    if (h >= 120 && h <= 180 && s > 60)  return COLOR_BLUE;
+    color_report_t last_color = {.detection = {COLOR_NONE, -999, -999}};
+    uint32_t last_aruco_status_ms = 0U;
 
-    return COLOR_NONE;
-}
+    for (;;)
+    {
+        camera_fb_t * p_frame = esp_camera_fb_get();
 
-typedef struct {
-    color_t color;   // R/G/B/N
-    int16_t x;       // centroid X in original pixels (0-319)
-    int16_t y;       // centroid Y in original pixels (0-239)
-    int16_t count;   // number of matching pixels
-} detection_t;
-
-static detection_t detect_dominant_color(camera_fb_t *fb)
-{
-    int counts[4]      = {0};
-    int32_t sum_x[4]   = {0};   // use int32_t to avoid overflow
-    int32_t sum_y[4]   = {0};
-    int total = 0;
-
-    uint8_t *buf = (uint8_t *)fb->buf;
-    int width  = fb->width;
-    int height = fb->height;
-    int bytes_per_pixel = 2;
-
-    for (int y = 0; y < height; y += STRIDE) {
-        for (int x = 0; x < width; x += STRIDE) {
-            int offset = (y * width + x) * bytes_per_pixel;
-            uint16_t pixel = (buf[offset] << 8) | buf[offset + 1];
-
-            uint8_t r = (pixel >> 11) & 0x1F;
-            uint8_t g = (pixel >> 5)  & 0x3F;
-            uint8_t b =  pixel        & 0x1F;
-
-            r = (r * 255) / 31;
-            g = (g * 255) / 63;
-            b = (b * 255) / 31;
-
-            uint8_t h, s, v;
-            rgb_to_hsv(r, g, b, &h, &s, &v);
-
-            color_t c = classify_hsv(h, s, v);
-            counts[c]++;
-            sum_x[c] += x;   // accumulate in stride-space
-            sum_y[c] += y;
-            total++;
+        if (p_frame == NULL)
+        {
+            ESP_LOGW(gp_tag, "Frame capture failed");
         }
-    }
+        else
+        {
+            if (g_mode == MODE_SCAN)
+            {
+                report_markers(p_frame, &last_aruco_status_ms);
+            }
+            else if (g_mode == MODE_COLOR)
+            {
+                report_color(p_frame, &last_color);
+            }
+            else
+            {
+                /* Idle mode still returns the acquired frame. */
+            }
 
-    detection_t result = { .color = COLOR_NONE, .x = -1, .y = -1, .count = 0 };
-
-    if (total == 0) return result;
-
-    // Find the strongest non-N color
-    int best = COLOR_NONE;
-    int best_count = 0;
-    for (int i = COLOR_RED; i <= COLOR_BLUE; i++) {
-        if (counts[i] > best_count) {
-            best_count = counts[i];
-            best = i;
+            esp_camera_fb_return(p_frame);
         }
+
+        vTaskDelay(pdMS_TO_TICKS(CAMERA_LOOP_MS));
     }
-
-    if (best == COLOR_NONE || (best_count * 100 / total) < 5) {
-        return result;   // no color wins
-    }
-
-    // Convert centroid from stride-space back to real pixel coords
-    result.color = best;
-    result.x     = (int16_t)((sum_x[best] / best_count));
-    result.y     = (int16_t)((sum_y[best] / best_count));
-    result.count = (int16_t)best_count;
-
-    return result;
 }
 
-// ======================================================
-// UART init
-// ======================================================
-static void init_uart(void)
+/** Configure the UART to match the Pico link. */
+static void initialise_uart (void)
 {
-    const uart_config_t uart_config = {
+    const uart_config_t uart_config =
+    {
         .baud_rate = VISION_UART_BAUD,
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
@@ -178,17 +165,17 @@ static void init_uart(void)
     ESP_ERROR_CHECK(uart_set_pin(VISION_UART_NUM,
                                  VISION_UART_TX_PIN, VISION_UART_RX_PIN,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    ESP_ERROR_CHECK(uart_driver_install(VISION_UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
-    ESP_LOGI(TAG, "UART initialized on TX:%d, RX:%d",
+    ESP_ERROR_CHECK(uart_driver_install(VISION_UART_NUM, BUF_SIZE * 2,
+                                        0, 0, NULL, 0));
+    ESP_LOGI(gp_tag, "UART initialized on TX:%d, RX:%d",
              VISION_UART_TX_PIN, VISION_UART_RX_PIN);
 }
 
-// ======================================================
-// Camera init
-// ======================================================
-static esp_err_t init_camera(void)
+/** Initialise the XIAO camera and enable automatic sensor controls. */
+static esp_err_t initialise_camera (void)
 {
-    camera_config_t config = {
+    camera_config_t const config =
+    {
         .pin_pwdn     = PWDN_GPIO_NUM,
         .pin_reset    = RESET_GPIO_NUM,
         .pin_xclk     = XCLK_GPIO_NUM,
@@ -217,198 +204,465 @@ static esp_err_t init_camera(void)
     };
 
     esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
+
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(gp_tag, "Camera init failed: 0x%x", err);
     }
 
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-            // AWB/AEC enabled by default; just let it run for a second
-        vTaskDelay(pdMS_TO_TICKS(1500));
+    sensor_t * p_sensor = esp_camera_sensor_get();
 
-        // Then lock the gains at whatever AWB decided
-        s->set_whitebal(s, 0);
-        s->set_awb_gain(s, 0);
-        s->set_exposure_ctrl(s, 0);
-        s->set_gain_ctrl(s, 0);
-        // Optional: set a manual white balance for your lighting
-        // s->set_wb_mode(s, 1);    // 0=auto, 1=sunny, 2=cloudy, 3=office, 4=home
+    if (p_sensor != NULL)
+    {
+        /* Keep automatic exposure and white balance across lighting changes. */
+        p_sensor->set_whitebal(p_sensor, 1);
+        p_sensor->set_awb_gain(p_sensor, 1);
+        p_sensor->set_exposure_ctrl(p_sensor, 1);
+        p_sensor->set_gain_ctrl(p_sensor, 1);
     }
     return err;
 }
 
-// ======================================================
-// app_main
-// ======================================================
-#define HISTORY_LEN 5
-static detection_t history[HISTORY_LEN];
-static int history_idx = 0;
-
-// Returns the consensus color and its averaged position
-static detection_t history_consensus(void)
+/** Apply the existing mode commands sent by the Pico. */
+static void apply_mode_command (uint8_t command)
 {
-    int counts[4] = {0};
-    for (int i = 0; i < HISTORY_LEN; i++) {
-        counts[history[i].color]++;
-    }
+    switch (command)
+    {
+        case '3':
+        case '8':
+            g_marker_size_mm = (command == '3') ? 30 : 80;
+            /* Fall through so the selected size is used in scan mode. */
+        case 'S':
+            g_mode = MODE_SCAN;
+            ESP_LOGI(gp_tag, "Switched to SCAN mode (marker size %d mm)",
+                     g_marker_size_mm);
+        break;
 
-    // Find the color with the most votes (need at least 3/5)
-    color_t winner = COLOR_NONE;
-    for (int c = COLOR_RED; c <= COLOR_BLUE; c++) {
-        if (counts[c] >= 3) { winner = (color_t)c; break; }
-    }
+        case 'C':
+            g_mode = MODE_COLOR;
+            ESP_LOGI(gp_tag, "Switched to COLOR mode");
+        break;
 
-    detection_t result = { .color = winner, .x = -1, .y = -1, .count = 0 };
-    if (winner == COLOR_NONE) return result;
+        case 'I':
+            g_mode = MODE_IDLE;
+        break;
 
-    // Average the (x, y) of frames that agreed with the winner
-    int32_t sx = 0, sy = 0, n = 0;
-    for (int i = 0; i < HISTORY_LEN; i++) {
-        if (history[i].color == winner && history[i].x >= 0) {
-            sx += history[i].x;
-            sy += history[i].y;
-            n++;
-        }
-    }
-    if (n > 0) {
-        result.x = (int16_t)(sx / n);
-        result.y = (int16_t)(sy / n);
-    }
-    return result;
-}
-
-
-// UART Task to listen for mode commands from the Pico
-static void uart_rx_task(void *arg)
-{
-    uint8_t byte;
-    int state = 0;
-    char last_cmd = 0;
-
-    while (1) {
-        int n = uart_read_bytes(VISION_UART_NUM, &byte, 1, pdMS_TO_TICKS(100));
-        if (n == 1) {
-            if (byte == '\r') continue;
-            // Look for the pattern "M,X\n"
-            if (state == 0 && byte == 'M') state = 1;
-            else if (state == 1 && byte == ',') state = 2;
-            else if (state == 2) {
-                last_cmd = byte;
-                state = 3;
-            } 
-            else if (state == 3 && byte == '\n') {
-                if (last_cmd == 'S') {
-                    g_mode = MODE_SCAN;
-                    ESP_LOGI(TAG, "Switched to SCAN mode");
-                }
-                else if (last_cmd == 'C') {
-                    g_mode = MODE_COLOR;
-                    ESP_LOGI(TAG, "Switched to COLOR mode");
-                }
-                else if (last_cmd == 'I') g_mode = MODE_IDLE;
-                state = 0;
-            } else {
-                state = 0;  // Reset on unexpected byte
-            }
-        }
+        default:
+            /* Leave the current mode selected for unknown commands. */
+        break;
     }
 }
 
-
-// Helper to calculate XOR checksum and append it
-static void send_with_checksum(const char* format, ...) {
-    char tx_buffer[64];
-    va_list args;
-    va_start(args, format);
-    int len = vsnprintf(tx_buffer, sizeof(tx_buffer), format, args);
-    va_end(args);
-
-    // Calculate XOR checksum
-    uint8_t checksum = 0;
-    for (int i = 0; i < len; i++) {
-        checksum ^= (uint8_t)tx_buffer[i];
-    }
-
-    len += snprintf(tx_buffer + len, sizeof(tx_buffer) - len, "*%02X\n", checksum);
-    uart_write_bytes(VISION_UART_NUM, tx_buffer, len);
-}
-
-void app_main(void)
+/** Read M commands without blocking the camera frame loop. */
+static void camera_uart_rx_task (void * p_argument)
 {
-    ESP_LOGI(TAG, "Starting color detection...");
-    init_uart();
+    command_state_t state = COMMAND_WAIT_PREFIX;
+    uint8_t command = 0U;
 
-    xTaskCreate(uart_rx_task, "uart_rx", 8192, NULL, 5, NULL);
+    (void)p_argument;
 
-    if (init_camera() != ESP_OK) {
-        ESP_LOGE(TAG, "Camera failed, halting");
-        return;
-    }
-    ESP_LOGI(TAG, "Camera ready.");
+    for (;;)
+    {
+        uint8_t byte = 0U;
+        int length = uart_read_bytes(VISION_UART_NUM, &byte, 1,
+                                     pdMS_TO_TICKS(UART_READ_TIMEOUT_MS));
 
-    color_t last_sent_color = COLOR_NONE;
-    int16_t last_sent_x = -999;
-    int16_t last_sent_y = -999;
-    uint32_t last_send_ms = 0;
-
-    while (1) {
-        camera_fb_t *fb = esp_camera_fb_get();
-
-        if (!fb) {
-            ESP_LOGW(TAG, "Frame capture failed");
-            vTaskDelay(pdMS_TO_TICKS(50));
+        if ((length != 1) || (byte == '\r'))
+        {
             continue;
         }
 
-        // Branch based on mode (MODE_SCAN / MODE_COLOR)
-        if (g_mode == MODE_SCAN) {
-            // Aruco Scanning
-            aruco_result_t res = aruco_detect_frame(fb);
-
-            if (res.detected) {
-                // Send using the checksum helper (no uart_write_bytes needed)
-                send_with_checksum("A,%d,%d,%d,%.1f,%.1f", 
-                                res.marker_id, (int)res.cx, (int)res.cy, res.width_px, res.distance_mm);
-            }
-        } else if (g_mode == MODE_COLOR) {
-            // COLOR DETECTION
-            detection_t det = detect_dominant_color(fb);
-
-            // Push into history
-            history[history_idx] = det;
-            history_idx = (history_idx + 1) % HISTORY_LEN;
-
-            detection_t consensus = history_consensus();
-            uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-
-            // Send if the color changed, position moved significantly, or it's been 1s
-            bool color_changed = (consensus.color != last_sent_color);
-            bool moved_far     = (abs(consensus.x - last_sent_x) > 10) ||
-                                (abs(consensus.y - last_sent_y) > 10);
-            bool stale         = (now_ms - last_send_ms) > 1000;
-
-            if (color_changed || moved_far || stale) {
-                const char *name = (consensus.color == COLOR_RED)   ? "R"
-                                : (consensus.color == COLOR_GREEN) ? "G"
-                                : (consensus.color == COLOR_BLUE)  ? "B"
-                                : "N";
-
-                if (consensus.color == COLOR_NONE || consensus.x < 0) {
-                    // Send using the checksum helper
-                    send_with_checksum("C,N");
-                } else {
-                    // Send using the checksum helper
-                    send_with_checksum("C,%s,%d,%d", name, consensus.x, consensus.y);
+        switch (state)
+        {
+            case COMMAND_WAIT_PREFIX:
+                if (byte == 'M')
+                {
+                    state = COMMAND_WAIT_COMMA;
                 }
-                
-                last_sent_color = consensus.color;
-                last_sent_x = consensus.x;
-                last_sent_y = consensus.y;
-                last_send_ms = now_ms;
-            }
-        }
+            break;
 
-        esp_camera_fb_return(fb);
-        vTaskDelay(pdMS_TO_TICKS(50));
+            case COMMAND_WAIT_COMMA:
+                state = (byte == ',') ? COMMAND_WAIT_MODE
+                                      : COMMAND_WAIT_PREFIX;
+            break;
+
+            case COMMAND_WAIT_MODE:
+                command = byte;
+                state   = COMMAND_WAIT_NEWLINE;
+            break;
+
+            case COMMAND_WAIT_NEWLINE:
+                if (byte == '\n')
+                {
+                    apply_mode_command(command);
+                }
+
+                state = COMMAND_WAIT_PREFIX;
+            break;
+
+            default:
+                state = COMMAND_WAIT_PREFIX;
+            break;
+        }
     }
 }
+
+/** Append the UART checksum and terminate the report with a newline. */
+static void send_with_checksum (char const * p_format, ...)
+{
+    static bool b_reported_first_frame = false;
+    char frame[UART_FRAME_CAPACITY];
+    va_list args;
+
+    va_start(args, p_format);
+    int payload_length = vsnprintf(frame, sizeof(frame), p_format, args);
+    va_end(args);
+
+    /* Reserve four bytes for the checksum suffix and one for the null. */
+    if ((payload_length < 0) ||
+        (payload_length > (UART_FRAME_CAPACITY - 5)))
+    {
+        ESP_LOGW(gp_tag, "UART report exceeds frame capacity");
+        return;
+    }
+
+    uint8_t checksum = 0U;
+
+    for (int index = 0; index < payload_length; ++index)
+    {
+        /* XOR the unsigned byte representation of each payload character. */
+        checksum ^= (uint8_t)frame[index];
+    }
+
+    int suffix_length = snprintf(frame + payload_length,
+                                 UART_FRAME_CAPACITY - payload_length,
+                                 "*%02X\n", (unsigned int)checksum);
+
+    if (suffix_length != 4)
+    {
+        return;
+    }
+
+    int frame_length = payload_length + suffix_length;
+    int written = uart_write_bytes(VISION_UART_NUM, frame, frame_length);
+
+    if (!b_reported_first_frame)
+    {
+        ESP_LOGI(gp_tag, "UART TX first frame: wrote %d/%d bytes",
+                 written, frame_length);
+        ESP_LOG_BUFFER_HEXDUMP(gp_tag, frame, frame_length, ESP_LOG_INFO);
+        b_reported_first_frame = true;
+    }
+}
+
+/** Report every visible ArUco marker in the frame. */
+static void report_markers (camera_fb_t * p_frame, uint32_t * p_last_status_ms)
+{
+    aruco_result_t results[ARUCO_RESULT_CAPACITY];
+    int marker_size_mm = g_marker_size_mm;
+
+    /* The configured marker sizes are 30 and 80, both exact as floats. */
+    int count = aruco_detect_frame(p_frame, (float)marker_size_mm,
+                                  results, ARUCO_RESULT_CAPACITY);
+    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    if ((now_ms - *p_last_status_ms) >= REPORT_INTERVAL_MS)
+    {
+        if (count > 0)
+        {
+            ESP_LOGI(gp_tag,
+                     "ArUco scan: %d marker(s), first ID %d, size %d mm",
+                     count, results[0].marker_id, marker_size_mm);
+        }
+        else
+        {
+            /* Frame dimensions are QVGA and fit the log argument types. */
+            ESP_LOGW(gp_tag,
+                     "ArUco scan: no markers; frame %ux%u "
+                     "format %d, size %d mm",
+                     (unsigned int)p_frame->width,
+                     (unsigned int)p_frame->height, (int)p_frame->format,
+                     marker_size_mm);
+        }
+
+        *p_last_status_ms = now_ms;
+    }
+
+    for (int index = 0; index < count; ++index)
+    {
+        aruco_result_t const * p_marker = &results[index];
+
+        if (p_marker->detected)
+        {
+            /* Detected corners are within the QVGA frame. */
+            send_with_checksum("A,%d,%d,%d,%.1f,%.1f",
+                               p_marker->marker_id, (int)p_marker->cx,
+                               (int)p_marker->cy, p_marker->width_px,
+                               p_marker->distance_mm);
+        }
+    }
+}
+
+/** Convert RGB into the existing 8-bit HSV representation. */
+static void rgb_to_hsv (uint8_t red, uint8_t green, uint8_t blue,
+                        uint8_t * p_hue, uint8_t * p_saturation,
+                        uint8_t * p_value)
+{
+    uint8_t maximum = (red > green) ? red : green;
+    uint8_t minimum = (red < green) ? red : green;
+
+    maximum = (maximum > blue) ? maximum : blue;
+    minimum = (minimum < blue) ? minimum : blue;
+
+    int32_t delta = maximum - minimum;
+    *p_value      = maximum;
+    *p_hue        = 0U;
+    *p_saturation = 0U;
+
+    if (maximum == 0U)
+    {
+        return;
+    }
+
+    /* Delta is bounded by maximum, so saturation fits in one byte. */
+    *p_saturation = (uint8_t)((delta * 255) / maximum);
+
+    if (delta == 0)
+    {
+        return;
+    }
+
+    int32_t hue = 0;
+
+    if (maximum == red)
+    {
+        hue = (43 * (green - blue)) / delta;
+    }
+    else if (maximum == green)
+    {
+        hue = 85 + ((43 * (blue - red)) / delta);
+    }
+    else
+    {
+        hue = 171 + ((43 * (red - green)) / delta);
+    }
+
+    if (hue < 0)
+    {
+        hue += 255;
+    }
+
+    if (hue > 255)
+    {
+        hue = 255;
+    }
+
+    /* Scaling and bounds above keep hue in the 8-bit range. */
+    *p_hue = (uint8_t)hue;
+}
+
+/** Apply the existing brightness, saturation, and hue thresholds. */
+static color_t classify_hsv (uint8_t hue, uint8_t saturation, uint8_t value)
+{
+    if ((value < 35U) || (saturation < 50U))
+    {
+        return COLOR_NONE;
+    }
+
+    if ((hue <= 20U) || (hue >= 235U))
+    {
+        return COLOR_RED;
+    }
+
+    if ((hue >= 50U) && (hue <= 110U))
+    {
+        return COLOR_GREEN;
+    }
+
+    if ((hue >= 115U) && (hue <= 195U))
+    {
+        return COLOR_BLUE;
+    }
+
+    return COLOR_NONE;
+}
+
+/** Read one RGB565 pixel and classify its hue. */
+static color_t classify_pixel (uint8_t const * p_pixel)
+{
+    /* Widen the high byte before shifting. Scaled channels fit in one byte. */
+    uint32_t packed = ((uint32_t)p_pixel[0] << 8U) | p_pixel[1];
+    uint8_t red     = (uint8_t)((((packed >> 11U) & 0x1FU) * 255U) / 31U);
+    uint8_t green   = (uint8_t)((((packed >> 5U) & 0x3FU) * 255U) / 63U);
+    uint8_t blue    = (uint8_t)(((packed & 0x1FU) * 255U) / 31U);
+
+    uint8_t hue        = 0U;
+    uint8_t saturation = 0U;
+    uint8_t value      = 0U;
+    rgb_to_hsv(red, green, blue, &hue, &saturation, &value);
+
+    return classify_hsv(hue, saturation, value);
+}
+
+/** Find the strongest color and its centroid in the sampled frame. */
+static color_detection_t detect_dominant_color (camera_fb_t const * p_frame)
+{
+    int32_t counts[COLOR_COUNT] = {0};
+    int32_t sum_x[COLOR_COUNT]  = {0};
+    int32_t sum_y[COLOR_COUNT]  = {0};
+    int32_t total               = 0;
+
+    /* The configured RGB565 frame is 320 by 240 with two bytes per pixel. */
+    int32_t width  = (int32_t)p_frame->width;
+    int32_t height = (int32_t)p_frame->height;
+
+    for (int32_t row = 0; row < height; row += STRIDE)
+    {
+        for (int32_t column = 0; column < width; column += STRIDE)
+        {
+            int32_t offset = ((row * width) + column) * 2;
+            color_t color = classify_pixel(&p_frame->buf[offset]);
+
+            ++counts[color];
+            sum_x[color] += column;
+            sum_y[color] += row;
+            ++total;
+        }
+    }
+
+    color_detection_t result = {COLOR_NONE, -1, -1};
+
+    if (total == 0)
+    {
+        return result;
+    }
+
+    color_t best = COLOR_NONE;
+    int32_t best_count = 0;
+
+    for (color_t color = COLOR_RED; color <= COLOR_BLUE; ++color)
+    {
+        if (counts[color] > best_count)
+        {
+            best_count = counts[color];
+            best       = color;
+        }
+    }
+
+    if ((best == COLOR_NONE) ||
+        (((best_count * 100) / total) < MIN_COLOR_PERCENT))
+    {
+        return result;
+    }
+
+    /* The average of QVGA pixel coordinates fits in a signed 16-bit value. */
+    result.color = best;
+    result.x     = (int16_t)(sum_x[best] / best_count);
+    result.y     = (int16_t)(sum_y[best] / best_count);
+    return result;
+}
+
+/** Require three matching frames and average their centroid. */
+static color_detection_t history_consensus (void)
+{
+    uint32_t votes[COLOR_COUNT] = {0U};
+
+    for (uint32_t index = 0U; index < HISTORY_LEN; ++index)
+    {
+        ++votes[g_color_history[index].color];
+    }
+
+    color_detection_t result = {COLOR_NONE, -1, -1};
+
+    for (color_t color = COLOR_RED; color <= COLOR_BLUE; ++color)
+    {
+        if (votes[color] >= COLOR_CONSENSUS_VOTES)
+        {
+            result.color = color;
+            break;
+        }
+    }
+
+    if (result.color == COLOR_NONE)
+    {
+        return result;
+    }
+
+    int32_t sum_x = 0;
+    int32_t sum_y = 0;
+    int32_t count = 0;
+
+    for (uint32_t index = 0U; index < HISTORY_LEN; ++index)
+    {
+        color_detection_t const * p_sample = &g_color_history[index];
+
+        if ((p_sample->color == result.color) && (p_sample->x >= 0))
+        {
+            sum_x += p_sample->x;
+            sum_y += p_sample->y;
+            ++count;
+        }
+    }
+
+    if (count > 0)
+    {
+        /* Averages remain within QVGA coordinate bounds. */
+        result.x = (int16_t)(sum_x / count);
+        result.y = (int16_t)(sum_y / count);
+    }
+
+    return result;
+}
+
+/** Translate a color result into its UART label. */
+static char const * color_name (color_t color)
+{
+    switch (color)
+    {
+        case COLOR_RED:   return "R";
+        case COLOR_GREEN: return "G";
+        case COLOR_BLUE:  return "B";
+        default:          return "N";
+    }
+}
+
+/** Send color reports on color changes, movement, or the refresh interval. */
+static void report_color (camera_fb_t const * p_frame,
+                          color_report_t * p_previous)
+{
+    g_color_history[g_history_index] = detect_dominant_color(p_frame);
+    g_history_index = (g_history_index + 1U) % HISTORY_LEN;
+
+    color_detection_t consensus = history_consensus();
+    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    bool b_color_changed = (consensus.color != p_previous->detection.color);
+    bool b_moved = (abs(consensus.x - p_previous->detection.x) >
+                    COLOR_MOVE_PIXELS) ||
+                   (abs(consensus.y - p_previous->detection.y) >
+                    COLOR_MOVE_PIXELS);
+    bool b_stale = (now_ms - p_previous->time_ms) > REPORT_INTERVAL_MS;
+
+    if (b_color_changed || b_moved || b_stale)
+    {
+        if ((consensus.color == COLOR_NONE) || (consensus.x < 0))
+        {
+            send_with_checksum("C,N");
+            ESP_LOGI(gp_tag, "No recognized color in the camera frame");
+        }
+        else
+        {
+            char const * p_name = color_name(consensus.color);
+
+            send_with_checksum("C,%s,%d,%d", p_name, consensus.x, consensus.y);
+            ESP_LOGI(gp_tag, "Color %s at (%d,%d)",
+                     p_name, consensus.x, consensus.y);
+        }
+
+        p_previous->detection = consensus;
+        p_previous->time_ms   = now_ms;
+    }
+}
+
+/* End of file. */
+
