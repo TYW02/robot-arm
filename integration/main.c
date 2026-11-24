@@ -995,34 +995,6 @@ static void camera_receive_marker (char * p_field)
     (void)tk_unl_mtx(mtx_id);
 }
 
-/** Log a color observation from the XIAO. */
-static void camera_receive_color (char * p_field)
-{
-    char color = *p_field;
-
-    if (color == 'N')
-    {
-        /* The monitor logger takes a format string in kernel byte types. */
-        robot_logf((UB const *)"  -> No recognized payload color\n");
-    }
-    else if ((color != '\0') && (p_field[1] == ','))
-    {
-        p_field += 2;
-
-        int position_x = camera_parse_integer(&p_field);
-        int position_y = camera_parse_integer(&p_field);
-
-        /* The monitor logger takes a format string in kernel byte types. */
-        robot_logf((UB const *)"  -> Payload found: COLOR %c at X:%d Y:%d\n",
-                   color, position_x, position_y);
-    }
-    else
-    {
-        /* The monitor logger takes a format string in kernel byte types. */
-        robot_logf((UB const *)"[UART RX] malformed color frame\n");
-    }
-}
-
 /** Dispatch a complete, checksum-verified UART frame. */
 static void camera_receive_frame (char * p_frame)
 {
@@ -1035,10 +1007,6 @@ static void camera_receive_frame (char * p_frame)
     if ((p_frame[0] == 'A') && (p_frame[1] == ','))
     {
         camera_receive_marker(p_frame + 2);
-    }
-    else if ((p_frame[0] == 'C') && (p_frame[1] == ','))
-    {
-        camera_receive_color(p_frame + 2);
     }
     else
     {
@@ -1155,10 +1123,10 @@ static void camera_append_byte (camera_rx_state_t * p_state, char byte)
     }
 }
 
-/** Assemble ArUco and color frames and recover after a lost separator. */
+/** Assemble ArUco frames and recover after a lost separator. */
 static void camera_receive_byte (camera_rx_state_t * p_state, char byte)
 {
-    bool b_is_prefix = (byte == 'A') || (byte == 'C');
+    bool b_is_prefix = (byte == 'A');
 
     if ((byte == '\r') || (byte == '\n'))
     {
@@ -1219,7 +1187,7 @@ static void camera_receive_byte (camera_rx_state_t * p_state, char byte)
         return;
     }
 
-    /* A or C inside the payload signals a new frame after a truncated one. */
+    /* A inside the payload signals a new frame after a truncated one. */
     if (b_is_prefix && (camera_checksum_start(p_state->frame) == NULL))
     {
         p_state->length = 0U;
